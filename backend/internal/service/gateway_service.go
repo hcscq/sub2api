@@ -1633,9 +1633,10 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 
 			if len(routingAvailable) > 0 {
 				if platform == PlatformAntigravity {
+					routingAvailable = s.preferDirectAntigravityAccountLoads(ctx, routingAvailable, requestedModel)
 					// Antigravity 在同优先级内优先避开近期失败/慢首字账号，再考虑负载和 LRU。
 					sort.SliceStable(routingAvailable, func(i, j int) bool {
-						return s.lessAntigravityLoadCandidate(routingAvailable[i], routingAvailable[j])
+						return s.lessAntigravityLoadCandidate(ctx, requestedModel, routingAvailable[i], routingAvailable[j])
 					})
 				} else {
 					// 排序：优先级 > 负载率 > 最后使用时间
@@ -1805,7 +1806,7 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 
 	loadMap, err := s.concurrencyService.GetAccountsLoadBatch(ctx, accountLoads)
 	if err != nil {
-		if result, ok, legacyErr := s.tryAcquireByLegacyOrder(ctx, candidates, groupID, sessionHash, preferOAuth); legacyErr != nil {
+		if result, ok, legacyErr := s.tryAcquireByLegacyOrder(ctx, candidates, groupID, sessionHash, preferOAuth, requestedModel); legacyErr != nil {
 			return nil, legacyErr
 		} else if ok {
 			return result, nil
@@ -1829,13 +1830,17 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 		for len(available) > 0 {
 			// 1. 取优先级最小的集合
 			candidates := filterByMinPriority(available)
-			// 2. Antigravity 先排除近期失败/慢首字的账号，再看负载
+			// 2. Antigravity 在同优先级内优先使用直连可用账号，只有没有直连候选时才回落到 credits。
+			if platform == PlatformAntigravity {
+				candidates = s.preferDirectAntigravityAccountLoads(ctx, candidates, requestedModel)
+			}
+			// 3. Antigravity 先排除近期失败/慢首字的账号，再看负载
 			if platform == PlatformAntigravity {
 				candidates = s.filterByMinAntigravityRuntimePenalty(candidates)
 			}
-			// 3. 取负载率最低的集合
+			// 4. 取负载率最低的集合
 			candidates = filterByMinLoadRate(candidates)
-			// 4. LRU 选择最久未用的账号
+			// 5. LRU 选择最久未用的账号
 			selected := selectByLRU(candidates, preferOAuth)
 			if selected == nil {
 				break
@@ -1868,7 +1873,8 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 
 	// ============ Layer 3: 兜底排队 ============
 	if platform == PlatformAntigravity {
-		s.sortAntigravityFallbackCandidates(candidates)
+		candidates = s.preferDirectAntigravityAccounts(ctx, candidates, requestedModel)
+		s.sortAntigravityFallbackCandidates(ctx, requestedModel, candidates)
 	} else {
 		s.sortCandidatesForFallback(candidates, preferOAuth, cfg.FallbackSelectionMode)
 	}
@@ -1887,7 +1893,7 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 	return nil, ErrNoAvailableAccounts
 }
 
-func (s *GatewayService) tryAcquireByLegacyOrder(ctx context.Context, candidates []*Account, groupID *int64, sessionHash string, preferOAuth bool) (*AccountSelectionResult, bool, error) {
+func (s *GatewayService) tryAcquireByLegacyOrder(ctx context.Context, candidates []*Account, groupID *int64, sessionHash string, preferOAuth bool, requestedModel string) (*AccountSelectionResult, bool, error) {
 	ordered := append([]*Account(nil), candidates...)
 	allAntigravity := len(ordered) > 0
 	for _, acc := range ordered {
@@ -1897,7 +1903,8 @@ func (s *GatewayService) tryAcquireByLegacyOrder(ctx context.Context, candidates
 		}
 	}
 	if allAntigravity {
-		s.sortAntigravityFallbackCandidates(ordered)
+		ordered = s.preferDirectAntigravityAccounts(ctx, ordered, requestedModel)
+		s.sortAntigravityFallbackCandidates(ctx, requestedModel, ordered)
 	} else {
 		sortAccountsByPriorityAndLastUsed(ordered, preferOAuth)
 	}
@@ -2193,11 +2200,111 @@ func (s *GatewayService) isAccountSchedulableForSelection(account *Account) bool
 	return account.IsSchedulable()
 }
 
+type antigravityModelSelectionMode int
+
+const (
+	antigravityModelSelectionUnavailable antigravityModelSelectionMode = iota
+	antigravityModelSelectionDirect
+	antigravityModelSelectionCreditsFallback
+)
+
+func (s *GatewayService) antigravityModelSelectionMode(ctx context.Context, account *Account, requestedModel string) antigravityModelSelectionMode {
+	if account == nil || account.Platform != PlatformAntigravity {
+		return antigravityModelSelectionUnavailable
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !account.IsSchedulable() {
+		return antigravityModelSelectionUnavailable
+	}
+	if !account.isModelRateLimitedWithContext(ctx, requestedModel) {
+		return antigravityModelSelectionDirect
+	}
+	if account.IsOveragesEnabled() && !account.isCreditsExhausted() {
+		return antigravityModelSelectionCreditsFallback
+	}
+	return antigravityModelSelectionUnavailable
+}
+
 func (s *GatewayService) isAccountSchedulableForModelSelection(ctx context.Context, account *Account, requestedModel string) bool {
 	if account == nil {
 		return false
 	}
+	if account.Platform == PlatformAntigravity {
+		return s.antigravityModelSelectionMode(ctx, account, requestedModel) != antigravityModelSelectionUnavailable
+	}
 	return account.IsSchedulableForModelWithContext(ctx, requestedModel)
+}
+
+func (s *GatewayService) antigravityModelSelectionBetter(ctx context.Context, requestedModel string, left, right *Account) (bool, bool) {
+	if left == nil || right == nil || left.Platform != PlatformAntigravity || right.Platform != PlatformAntigravity {
+		return false, false
+	}
+	leftMode := s.antigravityModelSelectionMode(ctx, left, requestedModel)
+	rightMode := s.antigravityModelSelectionMode(ctx, right, requestedModel)
+	if leftMode == rightMode {
+		return false, false
+	}
+	return leftMode < rightMode, true
+}
+
+func (s *GatewayService) preferDirectAntigravityAccountLoads(ctx context.Context, accounts []accountWithLoad, requestedModel string) []accountWithLoad {
+	if len(accounts) == 0 {
+		return accounts
+	}
+	hasDirect := false
+	hasCreditsFallback := false
+	for _, item := range accounts {
+		switch s.antigravityModelSelectionMode(ctx, item.account, requestedModel) {
+		case antigravityModelSelectionDirect:
+			hasDirect = true
+		case antigravityModelSelectionCreditsFallback:
+			hasCreditsFallback = true
+		}
+	}
+	if !hasDirect || !hasCreditsFallback {
+		return accounts
+	}
+	filtered := make([]accountWithLoad, 0, len(accounts))
+	for _, item := range accounts {
+		if s.antigravityModelSelectionMode(ctx, item.account, requestedModel) != antigravityModelSelectionCreditsFallback {
+			filtered = append(filtered, item)
+		}
+	}
+	if len(filtered) == 0 {
+		return accounts
+	}
+	return filtered
+}
+
+func (s *GatewayService) preferDirectAntigravityAccounts(ctx context.Context, accounts []*Account, requestedModel string) []*Account {
+	if len(accounts) == 0 {
+		return accounts
+	}
+	hasDirect := false
+	hasCreditsFallback := false
+	for _, account := range accounts {
+		switch s.antigravityModelSelectionMode(ctx, account, requestedModel) {
+		case antigravityModelSelectionDirect:
+			hasDirect = true
+		case antigravityModelSelectionCreditsFallback:
+			hasCreditsFallback = true
+		}
+	}
+	if !hasDirect || !hasCreditsFallback {
+		return accounts
+	}
+	filtered := make([]*Account, 0, len(accounts))
+	for _, account := range accounts {
+		if s.antigravityModelSelectionMode(ctx, account, requestedModel) != antigravityModelSelectionCreditsFallback {
+			filtered = append(filtered, account)
+		}
+	}
+	if len(filtered) == 0 {
+		return accounts
+	}
+	return filtered
 }
 
 // isAccountInGroup checks if the account belongs to the specified group.
@@ -2318,7 +2425,7 @@ func (s *GatewayService) antigravityRuntimeBetter(left, right *Account) (bool, b
 	return leftPenalty < rightPenalty, true
 }
 
-func (s *GatewayService) isBetterLegacyCandidate(candidate, selected *Account, preferOAuth bool) bool {
+func (s *GatewayService) isBetterLegacyCandidate(ctx context.Context, requestedModel string, candidate, selected *Account, preferOAuth bool) bool {
 	if candidate == nil {
 		return false
 	}
@@ -2327,6 +2434,9 @@ func (s *GatewayService) isBetterLegacyCandidate(candidate, selected *Account, p
 	}
 	if candidate.Priority != selected.Priority {
 		return candidate.Priority < selected.Priority
+	}
+	if better, decided := s.antigravityModelSelectionBetter(ctx, requestedModel, candidate, selected); decided {
+		return better
 	}
 	if better, decided := s.antigravityRuntimeBetter(candidate, selected); decided {
 		return better
@@ -2346,12 +2456,15 @@ func (s *GatewayService) isBetterLegacyCandidate(candidate, selected *Account, p
 	}
 }
 
-func (s *GatewayService) lessAntigravityLoadCandidate(left, right accountWithLoad) bool {
+func (s *GatewayService) lessAntigravityLoadCandidate(ctx context.Context, requestedModel string, left, right accountWithLoad) bool {
 	if left.account == nil || right.account == nil {
 		return false
 	}
 	if left.account.Priority != right.account.Priority {
 		return left.account.Priority < right.account.Priority
+	}
+	if better, decided := s.antigravityModelSelectionBetter(ctx, requestedModel, left.account, right.account); decided {
+		return better
 	}
 	if better, decided := s.antigravityRuntimeBetter(left.account, right.account); decided {
 		return better
@@ -2374,9 +2487,9 @@ func (s *GatewayService) lessAntigravityLoadCandidate(left, right accountWithLoa
 	}
 }
 
-func (s *GatewayService) sortAntigravityFallbackCandidates(accounts []*Account) {
+func (s *GatewayService) sortAntigravityFallbackCandidates(ctx context.Context, requestedModel string, accounts []*Account) {
 	sort.SliceStable(accounts, func(i, j int) bool {
-		return s.isBetterLegacyCandidate(accounts[i], accounts[j], false)
+		return s.isBetterLegacyCandidate(ctx, requestedModel, accounts[i], accounts[j], false)
 	})
 }
 
@@ -3091,7 +3204,7 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 			if !s.isAccountSchedulableForRPM(ctx, acc, false) {
 				continue
 			}
-			if s.isBetterLegacyCandidate(acc, selected, preferOAuth) {
+			if s.isBetterLegacyCandidate(ctx, requestedModel, acc, selected, preferOAuth) {
 				selected = acc
 			}
 		}
@@ -3186,7 +3299,7 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 		if !s.isAccountSchedulableForRPM(ctx, acc, false) {
 			continue
 		}
-		if s.isBetterLegacyCandidate(acc, selected, preferOAuth) {
+		if s.isBetterLegacyCandidate(ctx, requestedModel, acc, selected, preferOAuth) {
 			selected = acc
 		}
 	}
@@ -3313,7 +3426,7 @@ func (s *GatewayService) selectAccountWithMixedScheduling(ctx context.Context, g
 			if !s.isAccountSchedulableForRPM(ctx, acc, false) {
 				continue
 			}
-			if s.isBetterLegacyCandidate(acc, selected, preferOAuth && acc.Platform == PlatformGemini && selected != nil && selected.Platform == PlatformGemini) {
+			if s.isBetterLegacyCandidate(ctx, requestedModel, acc, selected, preferOAuth && acc.Platform == PlatformGemini && selected != nil && selected.Platform == PlatformGemini) {
 				selected = acc
 			}
 		}
@@ -3409,7 +3522,7 @@ func (s *GatewayService) selectAccountWithMixedScheduling(ctx context.Context, g
 		if !s.isAccountSchedulableForRPM(ctx, acc, false) {
 			continue
 		}
-		if s.isBetterLegacyCandidate(acc, selected, preferOAuth && acc.Platform == PlatformGemini && selected != nil && selected.Platform == PlatformGemini) {
+		if s.isBetterLegacyCandidate(ctx, requestedModel, acc, selected, preferOAuth && acc.Platform == PlatformGemini && selected != nil && selected.Platform == PlatformGemini) {
 			selected = acc
 		}
 	}

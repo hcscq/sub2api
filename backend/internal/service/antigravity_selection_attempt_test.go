@@ -206,3 +206,104 @@ func TestGatewayService_SelectAccountWithLoadAwareness_AntigravityFailurePenalty
 	require.NotNil(t, result.Account)
 	require.Equal(t, good.ID, result.Account.ID, "recently failed antigravity account should lose priority even when its load is lower")
 }
+
+func TestGatewayService_SelectAccountWithLoadAwareness_AntigravityDirectCandidateBeatsCreditsFallback(t *testing.T) {
+	now := time.Now()
+	creditsFallback := &Account{
+		ID:          31,
+		Platform:    PlatformAntigravity,
+		Status:      StatusActive,
+		Schedulable: true,
+		Priority:    1,
+		Extra: map[string]any{
+			"allow_overages": true,
+			modelRateLimitsKey: map[string]any{
+				"claude-sonnet-4-6": map[string]any{
+					"rate_limited_at":     now.UTC().Format(time.RFC3339),
+					"rate_limit_reset_at": now.Add(30 * time.Minute).UTC().Format(time.RFC3339),
+				},
+			},
+		},
+	}
+	direct := &Account{
+		ID:          32,
+		Platform:    PlatformAntigravity,
+		Status:      StatusActive,
+		Schedulable: true,
+		Priority:    1,
+		LastUsedAt:  ptr(now.Add(-1 * time.Hour)),
+	}
+	cache := &antigravitySelectionTouchCache{
+		snapshot: []*Account{creditsFallback, direct},
+		accounts: map[int64]*Account{
+			creditsFallback.ID: creditsFallback,
+			direct.ID:          direct,
+		},
+	}
+	schedulerSnapshot := NewSchedulerSnapshotService(cache, nil, nil, nil, nil)
+	concurrencyCache := mockConcurrencyCache{
+		loadMap: map[int64]*AccountLoadInfo{
+			creditsFallback.ID: {AccountID: creditsFallback.ID, LoadRate: 0},
+			direct.ID:          {AccountID: direct.ID, LoadRate: 0},
+		},
+	}
+	svc := &GatewayService{
+		schedulerSnapshot:  schedulerSnapshot,
+		concurrencyService: NewConcurrencyService(&concurrencyCache),
+		cache:              &mockGatewayCacheForPlatform{},
+		cfg:                testConfig(),
+	}
+	ctx := context.WithValue(context.Background(), ctxkey.ForcePlatform, PlatformAntigravity)
+
+	result, err := svc.SelectAccountWithLoadAwareness(ctx, nil, "", "claude-sonnet-4-6", nil, "", 0)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotNil(t, result.Account)
+	require.Equal(t, direct.ID, result.Account.ID, "when a direct antigravity account is available, credits fallback candidates should not win selection")
+}
+
+func TestGatewayService_SelectAccountForModelWithExclusions_AntigravityDirectCandidateBeatsCreditsFallback(t *testing.T) {
+	now := time.Now()
+	creditsFallback := &Account{
+		ID:          41,
+		Platform:    PlatformAntigravity,
+		Status:      StatusActive,
+		Schedulable: true,
+		Priority:    1,
+		Extra: map[string]any{
+			"allow_overages": true,
+			modelRateLimitsKey: map[string]any{
+				"claude-sonnet-4-6": map[string]any{
+					"rate_limited_at":     now.UTC().Format(time.RFC3339),
+					"rate_limit_reset_at": now.Add(30 * time.Minute).UTC().Format(time.RFC3339),
+				},
+			},
+		},
+	}
+	direct := &Account{
+		ID:          42,
+		Platform:    PlatformAntigravity,
+		Status:      StatusActive,
+		Schedulable: true,
+		Priority:    1,
+		LastUsedAt:  ptr(now.Add(-1 * time.Hour)),
+	}
+	cache := &antigravitySelectionTouchCache{
+		snapshot: []*Account{creditsFallback, direct},
+		accounts: map[int64]*Account{
+			creditsFallback.ID: creditsFallback,
+			direct.ID:          direct,
+		},
+	}
+	svc := &GatewayService{
+		schedulerSnapshot: NewSchedulerSnapshotService(cache, nil, nil, nil, nil),
+		cache:             &mockGatewayCacheForPlatform{},
+		cfg:               testConfig(),
+	}
+	ctx := context.WithValue(context.Background(), ctxkey.ForcePlatform, PlatformAntigravity)
+
+	selected, err := svc.SelectAccountForModelWithExclusions(ctx, nil, "", "claude-sonnet-4-6", nil)
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+	require.Equal(t, direct.ID, selected.ID, "legacy antigravity selection should also prefer direct accounts before credits fallback candidates")
+}
