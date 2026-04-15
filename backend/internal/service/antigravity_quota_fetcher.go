@@ -192,13 +192,7 @@ func (f *AntigravityQuotaFetcher) buildUsageInfo(modelsResp *antigravity.FetchAv
 	}
 
 	if loadResp != nil {
-		for _, credit := range loadResp.GetAvailableCredits() {
-			info.AICredits = append(info.AICredits, AICredit{
-				CreditType:     credit.CreditType,
-				Amount:         credit.GetAmount(),
-				MinimumBalance: credit.GetMinimumAmount(),
-			})
-		}
+		info.AICredits = append(info.AICredits, extractAICreditsFromLoadCodeAssist(loadResp)...)
 	}
 
 	return info

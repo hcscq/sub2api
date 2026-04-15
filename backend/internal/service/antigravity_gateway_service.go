@@ -687,7 +687,7 @@ urlFallbackLoop:
 
 				if overagesInjected && shouldMarkCreditsExhausted(resp, respBody, nil) {
 					modelKey := resolveCreditsOveragesModelKey(p.ctx, p.account, "", p.requestedModel)
-					s.handleCreditsRetryFailure(p.ctx, p.prefix, modelKey, p.account, &http.Response{
+					s.handleCreditsRetryFailure(p.ctx, p.prefix, modelKey, p.account, p.proxyURL, p.accessToken, &http.Response{
 						StatusCode: resp.StatusCode,
 						Header:     resp.Header.Clone(),
 						Body:       io.NopCloser(bytes.NewReader(respBody)),

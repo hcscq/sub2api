@@ -325,10 +325,25 @@ func TestAntigravityRetryLoop_CreditsExhausted_DoesNotInject(t *testing.T) {
 func TestAntigravityRetryLoop_CreditErrorMarksExhausted(t *testing.T) {
 	oldBaseURLs := append([]string(nil), antigravity.BaseURLs...)
 	oldAvailability := antigravity.DefaultURLAvailability
+	original := loadCodeAssistForCreditsCheck
 	defer func() {
 		antigravity.BaseURLs = oldBaseURLs
 		antigravity.DefaultURLAvailability = oldAvailability
+		loadCodeAssistForCreditsCheck = original
 	}()
+	loadCodeAssistForCreditsCheck = func(ctx context.Context, proxyURL, accessToken string) (*antigravity.LoadCodeAssistResponse, error) {
+		return &antigravity.LoadCodeAssistResponse{
+			PaidTier: &antigravity.PaidTierInfo{
+				AvailableCredits: []antigravity.AvailableCredit{
+					{
+						CreditType:                  googleOneAICreditType,
+						CreditAmount:                "0",
+						MinimumCreditAmountForUsage: "5",
+					},
+				},
+			},
+		}, nil
+	}
 
 	antigravity.BaseURLs = []string{"https://ag-1.test"}
 	antigravity.DefaultURLAvailability = antigravity.NewURLAvailability(time.Minute)
@@ -406,16 +421,16 @@ func TestShouldMarkCreditsExhausted(t *testing.T) {
 		require.False(t, shouldMarkCreditsExhausted(resp, []byte(`{"error":"Insufficient credits"}`), nil))
 	})
 
-	t.Run("Resource has been exhausted 应标记为积分耗尽", func(t *testing.T) {
+	t.Run("Resource has been exhausted 不应单独标记为积分耗尽", func(t *testing.T) {
 		resp := &http.Response{StatusCode: http.StatusTooManyRequests}
 		body := []byte(`{"error":{"message":"Resource has been exhausted"}}`)
-		require.True(t, shouldMarkCreditsExhausted(resp, body, nil))
+		require.False(t, shouldMarkCreditsExhausted(resp, body, nil))
 	})
 
-	t.Run("Resource has been exhausted (check quota) 完整格式应标记", func(t *testing.T) {
+	t.Run("Resource has been exhausted (check quota) 完整格式也不应单独标记", func(t *testing.T) {
 		resp := &http.Response{StatusCode: http.StatusTooManyRequests}
 		body := []byte(`{"error":{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED"}}`)
-		require.True(t, shouldMarkCreditsExhausted(resp, body, nil))
+		require.False(t, shouldMarkCreditsExhausted(resp, body, nil))
 	})
 
 	t.Run("结构化限流不标记", func(t *testing.T) {
@@ -540,5 +555,149 @@ func TestClearCreditsExhausted(t *testing.T) {
 		// 普通模型限流应保留
 		_, exists = rawLimits["claude-sonnet-4-5"]
 		require.True(t, exists, "普通模型限流应保留")
+	})
+}
+
+func TestHandleCreditsRetryFailure_ConfirmsBalanceBeforeMarking(t *testing.T) {
+	original := loadCodeAssistForCreditsCheck
+	t.Cleanup(func() {
+		loadCodeAssistForCreditsCheck = original
+	})
+
+	t.Run("余额仍足够时不标记且清理旧状态", func(t *testing.T) {
+		loadCodeAssistForCreditsCheck = func(ctx context.Context, proxyURL, accessToken string) (*antigravity.LoadCodeAssistResponse, error) {
+			return &antigravity.LoadCodeAssistResponse{
+				PaidTier: &antigravity.PaidTierInfo{
+					AvailableCredits: []antigravity.AvailableCredit{
+						{
+							CreditType:                  googleOneAICreditType,
+							CreditAmount:                "12",
+							MinimumCreditAmountForUsage: "5",
+						},
+					},
+				},
+			}, nil
+		}
+
+		repo := &stubAntigravityAccountRepo{}
+		svc := &AntigravityGatewayService{accountRepo: repo}
+		account := &Account{
+			ID: 1,
+			Extra: map[string]any{
+				modelRateLimitsKey: map[string]any{
+					creditsExhaustedKey: map[string]any{
+						"rate_limited_at":     time.Now().UTC().Format(time.RFC3339),
+						"rate_limit_reset_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+					},
+				},
+			},
+		}
+		resp := &http.Response{
+			StatusCode: http.StatusForbidden,
+			Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"Insufficient GOOGLE_ONE_AI credits"}}`)),
+		}
+
+		svc.handleCreditsRetryFailure(context.Background(), "[test]", "claude-sonnet-4-5", account, "", "token", resp, nil)
+
+		require.Empty(t, repo.modelRateLimitCalls)
+		require.Len(t, repo.extraUpdateCalls, 1)
+		rawLimits := account.Extra[modelRateLimitsKey].(map[string]any)
+		_, exists := rawLimits[creditsExhaustedKey]
+		require.False(t, exists)
+	})
+
+	t.Run("确认 credits 不可用时才标记", func(t *testing.T) {
+		loadCodeAssistForCreditsCheck = func(ctx context.Context, proxyURL, accessToken string) (*antigravity.LoadCodeAssistResponse, error) {
+			return &antigravity.LoadCodeAssistResponse{
+				PaidTier: &antigravity.PaidTierInfo{
+					AvailableCredits: []antigravity.AvailableCredit{
+						{
+							CreditType:                  googleOneAICreditType,
+							CreditAmount:                "5",
+							MinimumCreditAmountForUsage: "5",
+						},
+					},
+				},
+			}, nil
+		}
+
+		repo := &stubAntigravityAccountRepo{}
+		svc := &AntigravityGatewayService{accountRepo: repo}
+		account := &Account{ID: 2}
+		resp := &http.Response{
+			StatusCode: http.StatusForbidden,
+			Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"Insufficient GOOGLE_ONE_AI credits"}}`)),
+		}
+
+		svc.handleCreditsRetryFailure(context.Background(), "[test]", "claude-sonnet-4-5", account, "", "token", resp, nil)
+
+		require.Len(t, repo.modelRateLimitCalls, 1)
+		require.Equal(t, creditsExhaustedKey, repo.modelRateLimitCalls[0].modelKey)
+	})
+}
+
+func TestSyncCreditsExhaustedStateFromUsage(t *testing.T) {
+	t.Run("usage 显示 credits 已恢复时主动清理", func(t *testing.T) {
+		repo := &stubAntigravityAccountRepo{}
+		account := &Account{
+			ID: 1,
+			Extra: map[string]any{
+				modelRateLimitsKey: map[string]any{
+					creditsExhaustedKey: map[string]any{
+						"rate_limited_at":     time.Now().UTC().Format(time.RFC3339),
+						"rate_limit_reset_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+					},
+				},
+			},
+		}
+		usage := &UsageInfo{
+			AICredits: []AICredit{
+				{
+					CreditType:     googleOneAICreditType,
+					Amount:         20,
+					MinimumBalance: 5,
+				},
+			},
+		}
+
+		cleared, err := syncCreditsExhaustedStateFromUsage(context.Background(), repo, account, usage)
+		require.NoError(t, err)
+		require.True(t, cleared)
+		require.Len(t, repo.extraUpdateCalls, 1)
+		rawLimits := account.Extra[modelRateLimitsKey].(map[string]any)
+		_, exists := rawLimits[creditsExhaustedKey]
+		require.False(t, exists)
+	})
+
+	t.Run("usage 未明确恢复时不清理", func(t *testing.T) {
+		repo := &stubAntigravityAccountRepo{}
+		account := &Account{
+			ID: 2,
+			Extra: map[string]any{
+				modelRateLimitsKey: map[string]any{
+					creditsExhaustedKey: map[string]any{
+						"rate_limited_at":     time.Now().UTC().Format(time.RFC3339),
+						"rate_limit_reset_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+					},
+				},
+			},
+		}
+		usage := &UsageInfo{
+			AICredits: []AICredit{
+				{
+					CreditType:     googleOneAICreditType,
+					Amount:         5,
+					MinimumBalance: 5,
+				},
+			},
+		}
+
+		cleared, err := syncCreditsExhaustedStateFromUsage(context.Background(), repo, account, usage)
+		require.NoError(t, err)
+		require.False(t, cleared)
+		require.Empty(t, repo.extraUpdateCalls)
+		rawLimits := account.Extra[modelRateLimitsKey].(map[string]any)
+		_, exists := rawLimits[creditsExhaustedKey]
+		require.True(t, exists)
 	})
 }

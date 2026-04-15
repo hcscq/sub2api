@@ -787,6 +787,11 @@ func (s *AccountUsageService) getAntigravityUsage(ctx context.Context, account *
 			ttl := antigravityCacheTTL(cache.usageInfo)
 			if time.Since(cache.timestamp) < ttl {
 				usage := cache.usageInfo
+				if cleared, err := syncCreditsExhaustedStateFromUsage(ctx, s.accountRepo, account, usage); err != nil {
+					slog.Warn("sync_antigravity_credits_state_failed", "account_id", account.ID, "error", err)
+				} else if cleared {
+					slog.Info("sync_antigravity_credits_state_cleared", "account_id", account.ID, "source", "cache")
+				}
 				if usage.FiveHour != nil && usage.FiveHour.ResetsAt != nil {
 					usage.FiveHour.RemainingSeconds = int(time.Until(*usage.FiveHour.ResetsAt).Seconds())
 				}
@@ -828,6 +833,11 @@ func (s *AccountUsageService) getAntigravityUsage(ctx context.Context, account *
 		}
 
 		enrichUsageWithAccountError(fetchResult.UsageInfo, account)
+		if cleared, err := syncCreditsExhaustedStateFromUsage(fetchCtx, s.accountRepo, account, fetchResult.UsageInfo); err != nil {
+			slog.Warn("sync_antigravity_credits_state_failed", "account_id", account.ID, "error", err)
+		} else if cleared {
+			slog.Info("sync_antigravity_credits_state_cleared", "account_id", account.ID, "source", "fetch")
+		}
 		s.cache.antigravityCache.Store(account.ID, &antigravityUsageCache{
 			usageInfo: fetchResult.UsageInfo,
 			timestamp: time.Now(),
