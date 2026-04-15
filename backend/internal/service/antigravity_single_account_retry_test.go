@@ -23,6 +23,19 @@ func ctxWithSingleAccountRetry() context.Context {
 	return context.WithValue(context.Background(), ctxkey.SingleAccountRetry, true)
 }
 
+func resetModelCapacityExhaustedStateForTest(t *testing.T) {
+	t.Helper()
+
+	clearState := func() {
+		modelCapacityExhaustedMu.Lock()
+		defer modelCapacityExhaustedMu.Unlock()
+		modelCapacityExhaustedUntil = make(map[string]time.Time)
+	}
+
+	clearState()
+	t.Cleanup(clearState)
+}
+
 // ---------------------------------------------------------------------------
 // 1. isSingleAccountRetry 测试
 // ---------------------------------------------------------------------------
@@ -68,6 +81,8 @@ func TestSingleAccountRetryConstants(t *testing.T) {
 // 核心场景：503 + retryDelay >= 7s + SingleAccountRetry 标记
 // → 不设模型限流、不切换账号，改为原地重试
 func TestHandleSmartRetry_503_LongDelay_SingleAccountRetry_RetryInPlace(t *testing.T) {
+	resetModelCapacityExhaustedStateForTest(t)
+
 	// 原地重试成功
 	successResp := &http.Response{
 		StatusCode: http.StatusOK,
@@ -145,6 +160,8 @@ func TestHandleSmartRetry_503_LongDelay_SingleAccountRetry_RetryInPlace(t *testi
 // 对照组：503 + retryDelay >= 7s + 无 SingleAccountRetry 标记
 // → 照常设模型限流 + 切换账号
 func TestHandleSmartRetry_503_LongDelay_NoSingleAccountRetry_StillSwitches(t *testing.T) {
+	resetModelCapacityExhaustedStateForTest(t)
+
 	repo := &stubAntigravityAccountRepo{}
 	account := &Account{
 		ID:       2,
@@ -204,6 +221,8 @@ func TestHandleSmartRetry_503_LongDelay_NoSingleAccountRetry_StillSwitches(t *te
 // 边界情况：429（非 503）+ SingleAccountRetry 标记
 // → 单账号原地重试仅针对 503，429 依然走切换账号逻辑
 func TestHandleSmartRetry_429_LongDelay_SingleAccountRetry_StillSwitches(t *testing.T) {
+	resetModelCapacityExhaustedStateForTest(t)
+
 	repo := &stubAntigravityAccountRepo{}
 	account := &Account{
 		ID:       3,
@@ -262,6 +281,8 @@ func TestHandleSmartRetry_429_LongDelay_SingleAccountRetry_StillSwitches(t *test
 // 503 + retryDelay < 7s + SingleAccountRetry → 智能重试耗尽后直接返回 503，不设限流
 // 使用 RATE_LIMIT_EXCEEDED（走 1 次智能重试），避免 MODEL_CAPACITY_EXHAUSTED 的 60 次重试导致测试超时
 func TestHandleSmartRetry_503_ShortDelay_SingleAccountRetry_NoRateLimit(t *testing.T) {
+	resetModelCapacityExhaustedStateForTest(t)
+
 	// 智能重试也返回 503
 	failRespBody := `{
 		"error": {
@@ -344,6 +365,8 @@ func TestHandleSmartRetry_503_ShortDelay_SingleAccountRetry_NoRateLimit(t *testi
 // 对照组：503 + retryDelay < 7s + 无 SingleAccountRetry → 智能重试耗尽后照常设限流
 // 使用 RATE_LIMIT_EXCEEDED 而非 MODEL_CAPACITY_EXHAUSTED，因为后者走独立的 60 次重试路径
 func TestHandleSmartRetry_503_ShortDelay_NoSingleAccountRetry_SetsRateLimit(t *testing.T) {
+	resetModelCapacityExhaustedStateForTest(t)
+
 	failRespBody := `{
 		"error": {
 			"code": 503,
@@ -422,6 +445,8 @@ func TestHandleSmartRetry_503_ShortDelay_NoSingleAccountRetry_SetsRateLimit(t *t
 
 // TestHandleSingleAccountRetryInPlace_Success 原地重试成功
 func TestHandleSingleAccountRetryInPlace_Success(t *testing.T) {
+	resetModelCapacityExhaustedStateForTest(t)
+
 	successResp := &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{},
@@ -468,6 +493,8 @@ func TestHandleSingleAccountRetryInPlace_Success(t *testing.T) {
 
 // TestHandleSingleAccountRetryInPlace_AllRetriesFail 所有重试都失败，返回 503（不设限流）
 func TestHandleSingleAccountRetryInPlace_AllRetriesFail(t *testing.T) {
+	resetModelCapacityExhaustedStateForTest(t)
+
 	// 构造 3 个 503 响应（对应 3 次原地重试）
 	var responses []*http.Response
 	var errors []error
@@ -535,6 +562,8 @@ func TestHandleSingleAccountRetryInPlace_AllRetriesFail(t *testing.T) {
 
 // TestHandleSingleAccountRetryInPlace_WaitDurationClamped 等待时间被限制在 [min, max] 范围
 func TestHandleSingleAccountRetryInPlace_WaitDurationClamped(t *testing.T) {
+	resetModelCapacityExhaustedStateForTest(t)
+
 	// 用短延迟的成功响应，只验证不 panic
 	successResp := &http.Response{
 		StatusCode: http.StatusOK,
@@ -582,6 +611,8 @@ func TestHandleSingleAccountRetryInPlace_WaitDurationClamped(t *testing.T) {
 
 // TestHandleSingleAccountRetryInPlace_ContextCanceled context 取消时立即返回
 func TestHandleSingleAccountRetryInPlace_ContextCanceled(t *testing.T) {
+	resetModelCapacityExhaustedStateForTest(t)
+
 	upstream := &mockSmartRetryUpstream{
 		responses: []*http.Response{nil},
 		errors:    []error{nil},
@@ -626,6 +657,8 @@ func TestHandleSingleAccountRetryInPlace_ContextCanceled(t *testing.T) {
 
 // TestHandleSingleAccountRetryInPlace_NetworkError_ContinuesRetry 网络错误时继续重试
 func TestHandleSingleAccountRetryInPlace_NetworkError_ContinuesRetry(t *testing.T) {
+	resetModelCapacityExhaustedStateForTest(t)
+
 	successResp := &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{},
@@ -677,6 +710,8 @@ func TestHandleSingleAccountRetryInPlace_NetworkError_ContinuesRetry(t *testing.
 // TestAntigravityRetryLoop_PreCheck_SingleAccountRetry_SkipsRateLimit
 // 预检查中，如果有 SingleAccountRetry 标记，即使账号已限流也跳过直接发请求
 func TestAntigravityRetryLoop_PreCheck_SingleAccountRetry_SkipsRateLimit(t *testing.T) {
+	resetModelCapacityExhaustedStateForTest(t)
+
 	// 创建一个已设模型限流的账号
 	upstream := &recordingOKUpstream{}
 	account := &Account{
@@ -722,6 +757,8 @@ func TestAntigravityRetryLoop_PreCheck_SingleAccountRetry_SkipsRateLimit(t *test
 // TestAntigravityRetryLoop_PreCheck_NoSingleAccountRetry_SwitchesOnRateLimit
 // 对照组：无 SingleAccountRetry + 已限流 → 预检查返回 switchError
 func TestAntigravityRetryLoop_PreCheck_NoSingleAccountRetry_SwitchesOnRateLimit(t *testing.T) {
+	resetModelCapacityExhaustedStateForTest(t)
+
 	upstream := &recordingOKUpstream{}
 	account := &Account{
 		ID:          21,
@@ -774,6 +811,8 @@ func TestAntigravityRetryLoop_PreCheck_NoSingleAccountRetry_SwitchesOnRateLimit(
 // TestHandleSmartRetry_503_SingleAccount_RetryInPlace_ThenSuccess_E2E
 // 端到端场景：503 + 单账号 + 原地重试第2次成功
 func TestHandleSmartRetry_503_SingleAccount_RetryInPlace_ThenSuccess_E2E(t *testing.T) {
+	resetModelCapacityExhaustedStateForTest(t)
+
 	// 第1次原地重试仍返回 503，第2次成功
 	fail503Body := `{
 		"error": {
@@ -838,6 +877,8 @@ func TestHandleSmartRetry_503_SingleAccount_RetryInPlace_ThenSuccess_E2E(t *test
 // TestAntigravityRetryLoop_503_SingleAccount_InPlaceRetryUsed_E2E
 // 通过 antigravityRetryLoop → handleSmartRetry → handleSingleAccountRetryInPlace 完整链路
 func TestAntigravityRetryLoop_503_SingleAccount_InPlaceRetryUsed_E2E(t *testing.T) {
+	resetModelCapacityExhaustedStateForTest(t)
+
 	// 初始请求返回 503 + 长延迟
 	initial503Body := []byte(`{
 		"error": {
