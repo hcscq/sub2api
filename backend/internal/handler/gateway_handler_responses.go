@@ -159,7 +159,10 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 	sessionHash := h.gatewayService.GenerateSessionHash(parsedReq)
 
 	// 3. Account selection + failover loop
+	singleAccountRetryEnabled := h.gatewayService.IsSingleAntigravityAccountGroup(c.Request.Context(), apiKey.GroupID)
+	c.Request = c.Request.WithContext(service.WithSingleAccountRetry(c.Request.Context(), singleAccountRetryEnabled, h.metadataBridgeEnabled()))
 	fs := NewFailoverState(h.maxAccountSwitches, false)
+	fs.SetSingleAccountBackoffEnabled(singleAccountRetryEnabled)
 
 	for {
 		selection, err := h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), apiKey.GroupID, sessionHash, reqModel, fs.FailedAccountIDs, "", int64(0))
@@ -171,6 +174,7 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 			action := fs.HandleSelectionExhausted(c.Request.Context())
 			switch action {
 			case FailoverContinue:
+				c.Request = c.Request.WithContext(service.WithSingleAccountRetry(c.Request.Context(), singleAccountRetryEnabled, h.metadataBridgeEnabled()))
 				continue
 			case FailoverCanceled:
 				return

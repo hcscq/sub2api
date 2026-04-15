@@ -56,6 +56,7 @@ func TestNewFailoverState(t *testing.T) {
 		require.Nil(t, fs.LastFailoverErr)
 		require.False(t, fs.ForceCacheBilling)
 		require.True(t, fs.hasBoundSession)
+		require.False(t, fs.singleAccountBackoff)
 	})
 
 	t.Run("无绑定会话", func(t *testing.T) {
@@ -67,6 +68,12 @@ func TestNewFailoverState(t *testing.T) {
 	t.Run("零最大切换次数", func(t *testing.T) {
 		fs := NewFailoverState(0, false)
 		require.Equal(t, 0, fs.MaxSwitches)
+	})
+
+	t.Run("可启用单账号回退", func(t *testing.T) {
+		fs := NewFailoverState(3, false)
+		fs.SetSingleAccountBackoffEnabled(true)
+		require.True(t, fs.singleAccountBackoff)
 	})
 }
 
@@ -215,6 +222,35 @@ func TestHandleFailoverError_BasicSwitch(t *testing.T) {
 		action := fs.HandleFailoverError(context.Background(), mock, 100, "openai", err)
 		require.Equal(t, FailoverExhausted, action)
 		require.Equal(t, 0, fs.SwitchCount)
+		require.Contains(t, fs.FailedAccountIDs, int64(100))
+	})
+
+	t.Run("MODEL_CAPACITY_EXHAUSTED 在多账号场景直接结束", func(t *testing.T) {
+		mock := &mockTempUnscheduler{}
+		fs := NewFailoverState(3, false)
+		err := newTestFailoverErr(503, false, false)
+		err.ModelCapacityExhausted = true
+
+		action := fs.HandleFailoverError(context.Background(), mock, 100, service.PlatformAntigravity, err)
+
+		require.Equal(t, FailoverExhausted, action)
+		require.Zero(t, fs.SwitchCount)
+		require.Empty(t, fs.FailedAccountIDs)
+		require.Equal(t, err, fs.LastFailoverErr)
+		require.Empty(t, mock.calls)
+	})
+
+	t.Run("MODEL_CAPACITY_EXHAUSTED 在单账号场景仍进入外层回退", func(t *testing.T) {
+		mock := &mockTempUnscheduler{}
+		fs := NewFailoverState(3, false)
+		fs.SetSingleAccountBackoffEnabled(true)
+		err := newTestFailoverErr(503, false, false)
+		err.ModelCapacityExhausted = true
+
+		action := fs.HandleFailoverError(context.Background(), mock, 100, service.PlatformAntigravity, err)
+
+		require.Equal(t, FailoverContinue, action)
+		require.Equal(t, 1, fs.SwitchCount)
 		require.Contains(t, fs.FailedAccountIDs, int64(100))
 	})
 }
@@ -676,6 +712,7 @@ func TestHandleSelectionExhausted(t *testing.T) {
 
 	t.Run("503且未耗尽_等待后返回Continue并清除失败列表", func(t *testing.T) {
 		fs := NewFailoverState(3, false)
+		fs.SetSingleAccountBackoffEnabled(true)
 		fs.LastFailoverErr = newTestFailoverErr(503, false, false)
 		fs.FailedAccountIDs[100] = struct{}{}
 		fs.SwitchCount = 1
@@ -692,6 +729,7 @@ func TestHandleSelectionExhausted(t *testing.T) {
 
 	t.Run("503但SwitchCount已超过MaxSwitches_返回Exhausted", func(t *testing.T) {
 		fs := NewFailoverState(2, false)
+		fs.SetSingleAccountBackoffEnabled(true)
 		fs.LastFailoverErr = newTestFailoverErr(503, false, false)
 		fs.SwitchCount = 3 // > MaxSwitches(2)
 
@@ -705,6 +743,7 @@ func TestHandleSelectionExhausted(t *testing.T) {
 
 	t.Run("503但context已取消_返回Canceled", func(t *testing.T) {
 		fs := NewFailoverState(3, false)
+		fs.SetSingleAccountBackoffEnabled(true)
 		fs.LastFailoverErr = newTestFailoverErr(503, false, false)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -718,12 +757,22 @@ func TestHandleSelectionExhausted(t *testing.T) {
 		require.Less(t, elapsed, 100*time.Millisecond, "应立即返回")
 	})
 
-	t.Run("503且SwitchCount等于MaxSwitches_仍可重试", func(t *testing.T) {
+	t.Run("503且SwitchCount等于MaxSwitches_不再额外重试", func(t *testing.T) {
 		fs := NewFailoverState(2, false)
+		fs.SetSingleAccountBackoffEnabled(true)
 		fs.LastFailoverErr = newTestFailoverErr(503, false, false)
-		fs.SwitchCount = 2 // == MaxSwitches，条件是 <=，仍可重试
+		fs.SwitchCount = 2 // == MaxSwitches，不应再进入额外 2s 回退
 
 		action := fs.HandleSelectionExhausted(context.Background())
-		require.Equal(t, FailoverContinue, action)
+		require.Equal(t, FailoverExhausted, action)
+	})
+
+	t.Run("未启用单账号回退时503返回Exhausted", func(t *testing.T) {
+		fs := NewFailoverState(2, false)
+		fs.LastFailoverErr = newTestFailoverErr(503, false, false)
+		fs.SwitchCount = 1
+
+		action := fs.HandleSelectionExhausted(context.Background())
+		require.Equal(t, FailoverExhausted, action)
 	})
 }

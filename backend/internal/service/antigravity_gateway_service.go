@@ -1734,7 +1734,12 @@ func (s *AntigravityGatewayService) Forward(ctx context.Context, c *gin.Context,
 				}
 			}
 
+			modelCapacityExhausted := isAntigravityModelCapacityExhaustedResponse(resp.StatusCode, respBody)
 			if s.shouldFailoverUpstreamError(resp.StatusCode) {
+				eventKind := "failover"
+				if modelCapacityExhausted {
+					eventKind = "model_capacity_exhausted"
+				}
 				upstreamMsg := strings.TrimSpace(extractAntigravityErrorMessage(respBody))
 				upstreamMsg = sanitizeUpstreamErrorMessage(upstreamMsg)
 				upstreamDetail := s.getUpstreamErrorDetail(respBody)
@@ -1744,11 +1749,15 @@ func (s *AntigravityGatewayService) Forward(ctx context.Context, c *gin.Context,
 					AccountName:        account.Name,
 					UpstreamStatusCode: resp.StatusCode,
 					UpstreamRequestID:  resp.Header.Get("x-request-id"),
-					Kind:               "failover",
+					Kind:               eventKind,
 					Message:            upstreamMsg,
 					Detail:             upstreamDetail,
 				})
-				return nil, &UpstreamFailoverError{StatusCode: resp.StatusCode, ResponseBody: respBody}
+				return nil, &UpstreamFailoverError{
+					StatusCode:             resp.StatusCode,
+					ResponseBody:           respBody,
+					ModelCapacityExhausted: modelCapacityExhausted,
+				}
 			}
 
 			return nil, s.writeMappedClaudeError(c, account, resp.StatusCode, resp.Header.Get("x-request-id"), respBody)
@@ -2405,18 +2414,27 @@ func (s *AntigravityGatewayService) ForwardGemini(ctx context.Context, c *gin.Co
 			return nil, &UpstreamFailoverError{StatusCode: resp.StatusCode, ResponseBody: unwrappedForOps, RetryableOnSameAccount: true}
 		}
 
+		modelCapacityExhausted := isAntigravityModelCapacityExhaustedResponse(resp.StatusCode, respBody, unwrappedForOps)
 		if s.shouldFailoverUpstreamError(resp.StatusCode) {
+			eventKind := "failover"
+			if modelCapacityExhausted {
+				eventKind = "model_capacity_exhausted"
+			}
 			appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
 				Platform:           account.Platform,
 				AccountID:          account.ID,
 				AccountName:        account.Name,
 				UpstreamStatusCode: resp.StatusCode,
 				UpstreamRequestID:  requestID,
-				Kind:               "failover",
+				Kind:               eventKind,
 				Message:            upstreamMsg,
 				Detail:             upstreamDetail,
 			})
-			return nil, &UpstreamFailoverError{StatusCode: resp.StatusCode, ResponseBody: unwrappedForOps}
+			return nil, &UpstreamFailoverError{
+				StatusCode:             resp.StatusCode,
+				ResponseBody:           unwrappedForOps,
+				ModelCapacityExhausted: modelCapacityExhausted,
+			}
 		}
 		if contentType == "" {
 			contentType = "application/json"
@@ -2499,6 +2517,21 @@ func (s *AntigravityGatewayService) shouldFailoverUpstreamError(statusCode int) 
 	default:
 		return statusCode >= 500
 	}
+}
+
+func isAntigravityModelCapacityExhaustedResponse(statusCode int, bodies ...[]byte) bool {
+	if statusCode != http.StatusServiceUnavailable {
+		return false
+	}
+	for _, body := range bodies {
+		if len(body) == 0 {
+			continue
+		}
+		if info := parseAntigravitySmartRetryInfo(body); info != nil && info.IsModelCapacityExhausted {
+			return true
+		}
+	}
+	return false
 }
 
 // isGoogleProjectConfigError 判断（已提取的小写）错误消息是否属于 Google 服务端配置类问题。

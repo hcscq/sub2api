@@ -48,6 +48,7 @@ type FailoverState struct {
 	LastFailoverErr       *service.UpstreamFailoverError
 	ForceCacheBilling     bool
 	hasBoundSession       bool
+	singleAccountBackoff  bool
 }
 
 // NewFailoverState 创建 failover 状态
@@ -58,6 +59,15 @@ func NewFailoverState(maxSwitches int, hasBoundSession bool) *FailoverState {
 		SameAccountRetryCount: make(map[int64]int),
 		hasBoundSession:       hasBoundSession,
 	}
+}
+
+// SetSingleAccountBackoffEnabled 控制是否允许 selection exhausted 走单账号 503 回退。
+// 仅应在 Antigravity 单账号分组场景开启。
+func (s *FailoverState) SetSingleAccountBackoffEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.singleAccountBackoff = enabled
 }
 
 // HandleFailoverError 处理 UpstreamFailoverError，返回下一步动作。
@@ -74,6 +84,16 @@ func (s *FailoverState) HandleFailoverError(
 	// 缓存计费判断
 	if needForceCacheBilling(s.hasBoundSession, failoverErr) {
 		s.ForceCacheBilling = true
+	}
+
+	// Antigravity 的 MODEL_CAPACITY_EXHAUSTED 属于模型共享容量池问题。
+	// 多账号场景下继续换号通常无意义，直接结束 failover；单账号场景交给 selection exhausted 回退。
+	if failoverErr.ModelCapacityExhausted && !s.singleAccountBackoff {
+		logger.FromContext(ctx).Warn("gateway.failover_model_capacity_exhausted",
+			zap.Int64("account_id", accountID),
+			zap.Int("upstream_status", failoverErr.StatusCode),
+		)
+		return FailoverExhausted
 	}
 
 	// 同账号重试：对 RetryableOnSameAccount 的临时性错误，先在同一账号上重试
@@ -125,16 +145,19 @@ func (s *FailoverState) HandleFailoverError(
 }
 
 // HandleSelectionExhausted 处理选号失败（所有候选账号都在排除列表中）时的退避重试决策。
-// 针对 Antigravity 单账号分组的 503 (MODEL_CAPACITY_EXHAUSTED) 场景：
+// 仅针对 Antigravity 单账号分组的 503 场景：
 // 清除排除列表、等待退避后重新选号。
+//
+// 使用前必须先调用 SetSingleAccountBackoffEnabled(true)。
 //
 // 返回 FailoverContinue 时，调用方应设置 SingleAccountRetry context 并 continue。
 // 返回 FailoverExhausted 时，调用方应返回错误响应。
 // 返回 FailoverCanceled 时，调用方应直接 return。
 func (s *FailoverState) HandleSelectionExhausted(ctx context.Context) FailoverAction {
-	if s.LastFailoverErr != nil &&
+	if s.singleAccountBackoff &&
+		s.LastFailoverErr != nil &&
 		s.LastFailoverErr.StatusCode == http.StatusServiceUnavailable &&
-		s.SwitchCount <= s.MaxSwitches {
+		s.SwitchCount < s.MaxSwitches {
 
 		logger.FromContext(ctx).Warn("gateway.failover_single_account_backoff",
 			zap.Duration("backoff_delay", singleAccountBackoffDelay),

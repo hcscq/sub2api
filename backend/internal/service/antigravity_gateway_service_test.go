@@ -176,6 +176,21 @@ func (s *queuedHTTPUpstreamStub) DoWithTLS(req *http.Request, proxyURL string, a
 	return s.Do(req, proxyURL, accountID, concurrency)
 }
 
+func newQueuedAntigravityErrorResponses(count int, statusCode int, body string) []*http.Response {
+	responses := make([]*http.Response, 0, count)
+	for i := 0; i < count; i++ {
+		responses = append(responses, &http.Response{
+			StatusCode: statusCode,
+			Header: http.Header{
+				"Content-Type": []string{"application/json"},
+				"X-Request-Id": []string{fmt.Sprintf("req-%d", i+1)},
+			},
+			Body: io.NopCloser(strings.NewReader(body)),
+		})
+	}
+	return responses
+}
+
 type antigravitySettingRepoStub struct{}
 
 func (s *antigravitySettingRepoStub) Get(ctx context.Context, key string) (*Setting, error) {
@@ -380,6 +395,134 @@ func TestAntigravityGatewayService_ForwardGemini_ModelRateLimitTriggersFailover(
 	require.Equal(t, http.StatusServiceUnavailable, failoverErr.StatusCode)
 	// 非粘性会话请求，ForceCacheBilling 应为 false
 	require.False(t, failoverErr.ForceCacheBilling, "ForceCacheBilling should be false for non-sticky session")
+}
+
+func TestAntigravityGatewayService_Forward_ModelCapacityExhaustedMarksFailover(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	writer := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(writer)
+
+	body, err := json.Marshal(map[string]any{
+		"model":      "claude-sonnet-4-5",
+		"messages":   []map[string]string{{"role": "user", "content": "hello"}},
+		"max_tokens": 32,
+	})
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	c.Request = req
+
+	respBody := `{
+		"error": {
+			"code": 503,
+			"status": "UNAVAILABLE",
+			"details": [
+				{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "metadata": {"model": "claude-sonnet-4-5"}, "reason": "MODEL_CAPACITY_EXHAUSTED"},
+				{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "1s"}
+			],
+			"message": "No capacity available"
+		}
+	}`
+	upstream := &queuedHTTPUpstreamStub{
+		responses: newQueuedAntigravityErrorResponses(4, http.StatusServiceUnavailable, respBody),
+	}
+	svc := &AntigravityGatewayService{
+		tokenProvider: &AntigravityTokenProvider{},
+		httpUpstream:  upstream,
+	}
+	account := &Account{
+		ID:          30,
+		Name:        "acc-model-capacity",
+		Platform:    PlatformAntigravity,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"access_token": "token",
+		},
+	}
+
+	modelCapacityExhaustedMu.Lock()
+	delete(modelCapacityExhaustedUntil, "claude-sonnet-4-5")
+	modelCapacityExhaustedMu.Unlock()
+	t.Cleanup(func() {
+		modelCapacityExhaustedMu.Lock()
+		delete(modelCapacityExhaustedUntil, "claude-sonnet-4-5")
+		modelCapacityExhaustedMu.Unlock()
+	})
+
+	result, err := svc.Forward(context.Background(), c, account, body, false)
+	require.Nil(t, result)
+	require.Error(t, err)
+
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, http.StatusServiceUnavailable, failoverErr.StatusCode)
+	require.True(t, failoverErr.ModelCapacityExhausted)
+}
+
+func TestAntigravityGatewayService_ForwardGemini_ModelCapacityExhaustedMarksFailover(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	writer := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(writer)
+
+	body, err := json.Marshal(map[string]any{
+		"contents": []map[string]any{
+			{"role": "user", "parts": []map[string]any{{"text": "hi"}}},
+		},
+	})
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-flash:generateContent", bytes.NewReader(body))
+	c.Request = req
+
+	respBody := `{
+		"error": {
+			"code": 503,
+			"status": "UNAVAILABLE",
+			"details": [
+				{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "metadata": {"model": "gemini-2.5-flash"}, "reason": "MODEL_CAPACITY_EXHAUSTED"},
+				{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "1s"}
+			],
+			"message": "No capacity available"
+		}
+	}`
+	upstream := &queuedHTTPUpstreamStub{
+		responses: newQueuedAntigravityErrorResponses(4, http.StatusServiceUnavailable, respBody),
+	}
+	svc := &AntigravityGatewayService{
+		tokenProvider: &AntigravityTokenProvider{},
+		httpUpstream:  upstream,
+	}
+	account := &Account{
+		ID:          31,
+		Name:        "acc-gemini-model-capacity",
+		Platform:    PlatformAntigravity,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"access_token": "token",
+		},
+	}
+
+	modelCapacityExhaustedMu.Lock()
+	delete(modelCapacityExhaustedUntil, "gemini-2.5-flash")
+	modelCapacityExhaustedMu.Unlock()
+	t.Cleanup(func() {
+		modelCapacityExhaustedMu.Lock()
+		delete(modelCapacityExhaustedUntil, "gemini-2.5-flash")
+		modelCapacityExhaustedMu.Unlock()
+	})
+
+	result, err := svc.ForwardGemini(context.Background(), c, account, "gemini-2.5-flash", "generateContent", false, body, false)
+	require.Nil(t, result)
+	require.Error(t, err)
+
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, http.StatusServiceUnavailable, failoverErr.StatusCode)
+	require.True(t, failoverErr.ModelCapacityExhausted)
 }
 
 // TestAntigravityGatewayService_Forward_StickySessionForceCacheBilling

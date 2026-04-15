@@ -288,14 +288,12 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 	hasBoundSession := sessionKey != "" && sessionBoundAccountID > 0
 
 	if platform == service.PlatformGemini {
-		fs := NewFailoverState(h.maxAccountSwitchesGemini, hasBoundSession)
+		singleAccountRetryEnabled := h.gatewayService.IsSingleAntigravityAccountGroup(c.Request.Context(), apiKey.GroupID)
+		ctx := service.WithSingleAccountRetry(c.Request.Context(), singleAccountRetryEnabled, h.metadataBridgeEnabled())
+		c.Request = c.Request.WithContext(ctx)
 
-		// 单账号分组提前设置 SingleAccountRetry 标记，让 Service 层首次 503 就不设模型限流标记。
-		// 避免单账号分组收到 503 (MODEL_CAPACITY_EXHAUSTED) 时设 29s 限流，导致后续请求连续快速失败。
-		if h.gatewayService.IsSingleAntigravityAccountGroup(c.Request.Context(), apiKey.GroupID) {
-			ctx := service.WithSingleAccountRetry(c.Request.Context(), true, h.metadataBridgeEnabled())
-			c.Request = c.Request.WithContext(ctx)
-		}
+		fs := NewFailoverState(h.maxAccountSwitchesGemini, hasBoundSession)
+		fs.SetSingleAccountBackoffEnabled(singleAccountRetryEnabled)
 
 		for {
 			selection, err := h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), apiKey.GroupID, sessionKey, reqModel, fs.FailedAccountIDs, "", int64(0)) // Gemini 不使用会话限制
@@ -307,7 +305,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 				action := fs.HandleSelectionExhausted(c.Request.Context())
 				switch action {
 				case FailoverContinue:
-					ctx := service.WithSingleAccountRetry(c.Request.Context(), true, h.metadataBridgeEnabled())
+					ctx := service.WithSingleAccountRetry(c.Request.Context(), singleAccountRetryEnabled, h.metadataBridgeEnabled())
 					c.Request = c.Request.WithContext(ctx)
 					continue
 				case FailoverCanceled:
@@ -519,15 +517,13 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 	}
 	fallbackUsed := false
 
-	// 单账号分组提前设置 SingleAccountRetry 标记，让 Service 层首次 503 就不设模型限流标记。
-	// 避免单账号分组收到 503 (MODEL_CAPACITY_EXHAUSTED) 时设 29s 限流，导致后续请求连续快速失败。
-	if h.gatewayService.IsSingleAntigravityAccountGroup(c.Request.Context(), currentAPIKey.GroupID) {
-		ctx := service.WithSingleAccountRetry(c.Request.Context(), true, h.metadataBridgeEnabled())
-		c.Request = c.Request.WithContext(ctx)
-	}
-
 	for {
+		singleAccountRetryEnabled := h.gatewayService.IsSingleAntigravityAccountGroup(c.Request.Context(), currentAPIKey.GroupID)
+		ctx := service.WithSingleAccountRetry(c.Request.Context(), singleAccountRetryEnabled, h.metadataBridgeEnabled())
+		c.Request = c.Request.WithContext(ctx)
+
 		fs := NewFailoverState(h.maxAccountSwitches, hasBoundSession)
+		fs.SetSingleAccountBackoffEnabled(singleAccountRetryEnabled)
 		retryWithFallback := false
 
 		for {
@@ -541,7 +537,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 				action := fs.HandleSelectionExhausted(c.Request.Context())
 				switch action {
 				case FailoverContinue:
-					ctx := service.WithSingleAccountRetry(c.Request.Context(), true, h.metadataBridgeEnabled())
+					ctx := service.WithSingleAccountRetry(c.Request.Context(), singleAccountRetryEnabled, h.metadataBridgeEnabled())
 					c.Request = c.Request.WithContext(ctx)
 					continue
 				case FailoverCanceled:
