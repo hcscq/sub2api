@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	mathrand "math/rand"
 	"net/http"
 	"net/url"
@@ -19,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -68,6 +70,105 @@ type forceCacheBillingKeyType struct{}
 type accountWithLoad struct {
 	account  *Account
 	loadInfo *AccountLoadInfo
+}
+
+type antigravityAccountRuntimeStats struct {
+	accounts     sync.Map
+	accountCount atomic.Int64
+}
+
+type antigravityAccountRuntimeStat struct {
+	errorRateEWMABits atomic.Uint64
+	ttftEWMABits      atomic.Uint64
+}
+
+func newAntigravityAccountRuntimeStats() *antigravityAccountRuntimeStats {
+	return &antigravityAccountRuntimeStats{}
+}
+
+func (s *antigravityAccountRuntimeStats) loadOrCreate(accountID int64) *antigravityAccountRuntimeStat {
+	if value, ok := s.accounts.Load(accountID); ok {
+		stat, _ := value.(*antigravityAccountRuntimeStat)
+		if stat != nil {
+			return stat
+		}
+	}
+
+	stat := &antigravityAccountRuntimeStat{}
+	stat.errorRateEWMABits.Store(math.Float64bits(math.NaN()))
+	stat.ttftEWMABits.Store(math.Float64bits(math.NaN()))
+	actual, loaded := s.accounts.LoadOrStore(accountID, stat)
+	if !loaded {
+		s.accountCount.Add(1)
+		return stat
+	}
+	existing, _ := actual.(*antigravityAccountRuntimeStat)
+	if existing != nil {
+		return existing
+	}
+	return stat
+}
+
+func updateAntigravityEWMA(target *atomic.Uint64, sample float64, alpha float64) {
+	for {
+		oldBits := target.Load()
+		oldValue := math.Float64frombits(oldBits)
+		if math.IsNaN(oldValue) {
+			if target.CompareAndSwap(oldBits, math.Float64bits(sample)) {
+				return
+			}
+			continue
+		}
+		newValue := alpha*sample + (1-alpha)*oldValue
+		if target.CompareAndSwap(oldBits, math.Float64bits(newValue)) {
+			return
+		}
+	}
+}
+
+func (s *antigravityAccountRuntimeStats) report(accountID int64, success bool, firstTokenMs *int) {
+	if s == nil || accountID <= 0 {
+		return
+	}
+	const alpha = 0.25
+	stat := s.loadOrCreate(accountID)
+
+	errorSample := 1.0
+	if success {
+		errorSample = 0.0
+	}
+	updateAntigravityEWMA(&stat.errorRateEWMABits, errorSample, alpha)
+
+	if success && firstTokenMs != nil && *firstTokenMs > 0 {
+		updateAntigravityEWMA(&stat.ttftEWMABits, float64(*firstTokenMs), alpha)
+	}
+}
+
+func (s *antigravityAccountRuntimeStats) snapshot(accountID int64) (errorRate float64, hasErrorRate bool, ttft float64, hasTTFT bool) {
+	if s == nil || accountID <= 0 {
+		return 0, false, 0, false
+	}
+	value, ok := s.accounts.Load(accountID)
+	if !ok {
+		return 0, false, 0, false
+	}
+	stat, _ := value.(*antigravityAccountRuntimeStat)
+	if stat == nil {
+		return 0, false, 0, false
+	}
+
+	errorValue := math.Float64frombits(stat.errorRateEWMABits.Load())
+	if !math.IsNaN(errorValue) {
+		errorRate = clamp01(errorValue)
+		hasErrorRate = true
+	}
+
+	ttftValue := math.Float64frombits(stat.ttftEWMABits.Load())
+	if !math.IsNaN(ttftValue) {
+		ttft = ttftValue
+		hasTTFT = true
+	}
+	return errorRate, hasErrorRate, ttft, hasTTFT
 }
 
 var ForceCacheBillingContextKey = forceCacheBillingKeyType{}
@@ -570,6 +671,7 @@ type GatewayService struct {
 	debugGatewayBodyFile  atomic.Pointer[os.File] // non-nil when SUB2API_DEBUG_GATEWAY_BODY is set
 	tlsFPProfileService   *TLSFingerprintProfileService
 	balanceNotifyService  *BalanceNotifyService
+	antigravityRuntime    *antigravityAccountRuntimeStats
 }
 
 // NewGatewayService creates a new GatewayService
@@ -635,6 +737,7 @@ func NewGatewayService(
 		channelService:       channelService,
 		resolver:             resolver,
 		balanceNotifyService: balanceNotifyService,
+		antigravityRuntime:   newAntigravityAccountRuntimeStats(),
 	}
 	svc.userGroupRateResolver = newUserGroupRateResolver(
 		userGroupRateRepo,
@@ -1528,27 +1631,34 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 			}
 
 			if len(routingAvailable) > 0 {
-				// 排序：优先级 > 负载率 > 最后使用时间
-				sort.SliceStable(routingAvailable, func(i, j int) bool {
-					a, b := routingAvailable[i], routingAvailable[j]
-					if a.account.Priority != b.account.Priority {
-						return a.account.Priority < b.account.Priority
-					}
-					if a.loadInfo.LoadRate != b.loadInfo.LoadRate {
-						return a.loadInfo.LoadRate < b.loadInfo.LoadRate
-					}
-					switch {
-					case a.account.LastUsedAt == nil && b.account.LastUsedAt != nil:
-						return true
-					case a.account.LastUsedAt != nil && b.account.LastUsedAt == nil:
-						return false
-					case a.account.LastUsedAt == nil && b.account.LastUsedAt == nil:
-						return false
-					default:
-						return a.account.LastUsedAt.Before(*b.account.LastUsedAt)
-					}
-				})
-				shuffleWithinSortGroups(routingAvailable)
+				if platform == PlatformAntigravity {
+					// Antigravity 在同优先级内优先避开近期失败/慢首字账号，再考虑负载和 LRU。
+					sort.SliceStable(routingAvailable, func(i, j int) bool {
+						return s.lessAntigravityLoadCandidate(routingAvailable[i], routingAvailable[j])
+					})
+				} else {
+					// 排序：优先级 > 负载率 > 最后使用时间
+					sort.SliceStable(routingAvailable, func(i, j int) bool {
+						a, b := routingAvailable[i], routingAvailable[j]
+						if a.account.Priority != b.account.Priority {
+							return a.account.Priority < b.account.Priority
+						}
+						if a.loadInfo.LoadRate != b.loadInfo.LoadRate {
+							return a.loadInfo.LoadRate < b.loadInfo.LoadRate
+						}
+						switch {
+						case a.account.LastUsedAt == nil && b.account.LastUsedAt != nil:
+							return true
+						case a.account.LastUsedAt != nil && b.account.LastUsedAt == nil:
+							return false
+						case a.account.LastUsedAt == nil && b.account.LastUsedAt == nil:
+							return false
+						default:
+							return a.account.LastUsedAt.Before(*b.account.LastUsedAt)
+						}
+					})
+					shuffleWithinSortGroups(routingAvailable)
+				}
 
 				// 4. 尝试获取槽位
 				for _, item := range routingAvailable {
@@ -1714,13 +1824,17 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 			}
 		}
 
-		// 分层过滤选择：优先级 → 负载率 → LRU
+		// 分层过滤选择：优先级 → Antigravity 运行态惩罚 → 负载率 → LRU
 		for len(available) > 0 {
 			// 1. 取优先级最小的集合
 			candidates := filterByMinPriority(available)
-			// 2. 取负载率最低的集合
+			// 2. Antigravity 先排除近期失败/慢首字的账号，再看负载
+			if platform == PlatformAntigravity {
+				candidates = s.filterByMinAntigravityRuntimePenalty(candidates)
+			}
+			// 3. 取负载率最低的集合
 			candidates = filterByMinLoadRate(candidates)
-			// 3. LRU 选择最久未用的账号
+			// 4. LRU 选择最久未用的账号
 			selected := selectByLRU(candidates, preferOAuth)
 			if selected == nil {
 				break
@@ -1752,7 +1866,11 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 	}
 
 	// ============ Layer 3: 兜底排队 ============
-	s.sortCandidatesForFallback(candidates, preferOAuth, cfg.FallbackSelectionMode)
+	if platform == PlatformAntigravity {
+		s.sortAntigravityFallbackCandidates(candidates)
+	} else {
+		s.sortCandidatesForFallback(candidates, preferOAuth, cfg.FallbackSelectionMode)
+	}
 	for _, acc := range candidates {
 		// 会话数量限制检查（等待计划也需要占用会话配额）
 		if !s.checkAndRegisterSession(ctx, acc, sessionHash) {
@@ -1770,7 +1888,18 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 
 func (s *GatewayService) tryAcquireByLegacyOrder(ctx context.Context, candidates []*Account, groupID *int64, sessionHash string, preferOAuth bool) (*AccountSelectionResult, bool, error) {
 	ordered := append([]*Account(nil), candidates...)
-	sortAccountsByPriorityAndLastUsed(ordered, preferOAuth)
+	allAntigravity := len(ordered) > 0
+	for _, acc := range ordered {
+		if acc == nil || acc.Platform != PlatformAntigravity {
+			allAntigravity = false
+			break
+		}
+	}
+	if allAntigravity {
+		s.sortAntigravityFallbackCandidates(ordered)
+	} else {
+		sortAccountsByPriorityAndLastUsed(ordered, preferOAuth)
+	}
 
 	for _, acc := range ordered {
 		result, err := s.tryAcquireAccountSlot(ctx, acc.ID, acc.Concurrency)
@@ -2093,6 +2222,161 @@ func (s *GatewayService) tryAcquireAccountSlot(ctx context.Context, accountID in
 		return &AcquireResult{Acquired: true, ReleaseFunc: func() {}}, nil
 	}
 	return s.concurrencyService.AcquireAccountSlot(ctx, accountID, maxConcurrency)
+}
+
+// MarkAntigravitySelectionAttempt records that an antigravity account was chosen for
+// an upstream attempt. This closes a scheduling feedback gap where repeatedly failing
+// accounts could remain "oldest" forever because last_used_at was only updated on
+// successful usage recording.
+func (s *GatewayService) MarkAntigravitySelectionAttempt(ctx context.Context, account *Account) {
+	if s == nil || account == nil || account.ID <= 0 || account.Platform != PlatformAntigravity {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	usedAt := time.Now()
+	if s.schedulerSnapshot != nil {
+		if err := s.schedulerSnapshot.TouchAccountLastUsed(ctx, account.ID, usedAt); err != nil {
+			logger.LegacyPrintf("service.gateway", "[AntigravitySelection] touch scheduler last_used failed: account=%d err=%v", account.ID, err)
+		}
+	}
+	if s.deferredService != nil {
+		s.deferredService.ScheduleLastUsedUpdateAt(account.ID, usedAt)
+	}
+}
+
+func (s *GatewayService) ReportAntigravityResult(accountID int64, success bool, firstTokenMs *int) {
+	if s == nil || s.antigravityRuntime == nil || accountID <= 0 {
+		return
+	}
+	s.antigravityRuntime.report(accountID, success, firstTokenMs)
+}
+
+func (s *GatewayService) antigravityRuntimePenaltyMilli(accountID int64) int {
+	if s == nil || s.antigravityRuntime == nil || accountID <= 0 {
+		return 0
+	}
+	errorRate, hasErrorRate, ttft, hasTTFT := s.antigravityRuntime.snapshot(accountID)
+	penalty := 0.0
+	if hasErrorRate {
+		penalty += errorRate * 3.0
+	}
+	if hasTTFT {
+		penalty += clamp01(ttft / 12000.0)
+	}
+	return int(math.Round(penalty * 1000))
+}
+
+func (s *GatewayService) filterByMinAntigravityRuntimePenalty(accounts []accountWithLoad) []accountWithLoad {
+	if len(accounts) == 0 {
+		return accounts
+	}
+	minPenalty := 0
+	hasAntigravity := false
+	for _, acc := range accounts {
+		if acc.account == nil || acc.account.Platform != PlatformAntigravity {
+			continue
+		}
+		penalty := s.antigravityRuntimePenaltyMilli(acc.account.ID)
+		if !hasAntigravity || penalty < minPenalty {
+			minPenalty = penalty
+			hasAntigravity = true
+		}
+	}
+	if !hasAntigravity {
+		return accounts
+	}
+	result := make([]accountWithLoad, 0, len(accounts))
+	for _, acc := range accounts {
+		if acc.account == nil || acc.account.Platform != PlatformAntigravity {
+			continue
+		}
+		if s.antigravityRuntimePenaltyMilli(acc.account.ID) == minPenalty {
+			result = append(result, acc)
+		}
+	}
+	if len(result) == 0 {
+		return accounts
+	}
+	return result
+}
+
+func (s *GatewayService) antigravityRuntimeBetter(left, right *Account) (bool, bool) {
+	if s == nil || left == nil || right == nil {
+		return false, false
+	}
+	if left.Platform != PlatformAntigravity || right.Platform != PlatformAntigravity {
+		return false, false
+	}
+	leftPenalty := s.antigravityRuntimePenaltyMilli(left.ID)
+	rightPenalty := s.antigravityRuntimePenaltyMilli(right.ID)
+	if leftPenalty == rightPenalty {
+		return false, false
+	}
+	return leftPenalty < rightPenalty, true
+}
+
+func (s *GatewayService) isBetterLegacyCandidate(candidate, selected *Account, preferOAuth bool) bool {
+	if candidate == nil {
+		return false
+	}
+	if selected == nil {
+		return true
+	}
+	if candidate.Priority != selected.Priority {
+		return candidate.Priority < selected.Priority
+	}
+	if better, decided := s.antigravityRuntimeBetter(candidate, selected); decided {
+		return better
+	}
+	switch {
+	case candidate.LastUsedAt == nil && selected.LastUsedAt != nil:
+		return true
+	case candidate.LastUsedAt != nil && selected.LastUsedAt == nil:
+		return false
+	case candidate.LastUsedAt == nil && selected.LastUsedAt == nil:
+		if preferOAuth && candidate.Type != selected.Type && candidate.Type == AccountTypeOAuth {
+			return true
+		}
+		return false
+	default:
+		return candidate.LastUsedAt.Before(*selected.LastUsedAt)
+	}
+}
+
+func (s *GatewayService) lessAntigravityLoadCandidate(left, right accountWithLoad) bool {
+	if left.account == nil || right.account == nil {
+		return false
+	}
+	if left.account.Priority != right.account.Priority {
+		return left.account.Priority < right.account.Priority
+	}
+	if better, decided := s.antigravityRuntimeBetter(left.account, right.account); decided {
+		return better
+	}
+	if left.loadInfo.LoadRate != right.loadInfo.LoadRate {
+		return left.loadInfo.LoadRate < right.loadInfo.LoadRate
+	}
+	switch {
+	case left.account.LastUsedAt == nil && right.account.LastUsedAt != nil:
+		return true
+	case left.account.LastUsedAt != nil && right.account.LastUsedAt == nil:
+		return false
+	case left.account.LastUsedAt == nil && right.account.LastUsedAt == nil:
+		return left.account.ID < right.account.ID
+	default:
+		if left.account.LastUsedAt.Equal(*right.account.LastUsedAt) {
+			return left.account.ID < right.account.ID
+		}
+		return left.account.LastUsedAt.Before(*right.account.LastUsedAt)
+	}
+}
+
+func (s *GatewayService) sortAntigravityFallbackCandidates(accounts []*Account) {
+	sort.SliceStable(accounts, func(i, j int) bool {
+		return s.isBetterLegacyCandidate(accounts[i], accounts[j], false)
+	})
 }
 
 type usageLogWindowStatsBatchProvider interface {
@@ -2806,27 +3090,8 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 			if !s.isAccountSchedulableForRPM(ctx, acc, false) {
 				continue
 			}
-			if selected == nil {
+			if s.isBetterLegacyCandidate(acc, selected, preferOAuth) {
 				selected = acc
-				continue
-			}
-			if acc.Priority < selected.Priority {
-				selected = acc
-			} else if acc.Priority == selected.Priority {
-				switch {
-				case acc.LastUsedAt == nil && selected.LastUsedAt != nil:
-					selected = acc
-				case acc.LastUsedAt != nil && selected.LastUsedAt == nil:
-					// keep selected (never used is preferred)
-				case acc.LastUsedAt == nil && selected.LastUsedAt == nil:
-					if preferOAuth && acc.Type != selected.Type && acc.Type == AccountTypeOAuth {
-						selected = acc
-					}
-				default:
-					if acc.LastUsedAt.Before(*selected.LastUsedAt) {
-						selected = acc
-					}
-				}
 			}
 		}
 
@@ -2920,27 +3185,8 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 		if !s.isAccountSchedulableForRPM(ctx, acc, false) {
 			continue
 		}
-		if selected == nil {
+		if s.isBetterLegacyCandidate(acc, selected, preferOAuth) {
 			selected = acc
-			continue
-		}
-		if acc.Priority < selected.Priority {
-			selected = acc
-		} else if acc.Priority == selected.Priority {
-			switch {
-			case acc.LastUsedAt == nil && selected.LastUsedAt != nil:
-				selected = acc
-			case acc.LastUsedAt != nil && selected.LastUsedAt == nil:
-				// keep selected (never used is preferred)
-			case acc.LastUsedAt == nil && selected.LastUsedAt == nil:
-				if preferOAuth && acc.Type != selected.Type && acc.Type == AccountTypeOAuth {
-					selected = acc
-				}
-			default:
-				if acc.LastUsedAt.Before(*selected.LastUsedAt) {
-					selected = acc
-				}
-			}
 		}
 	}
 
@@ -3066,27 +3312,8 @@ func (s *GatewayService) selectAccountWithMixedScheduling(ctx context.Context, g
 			if !s.isAccountSchedulableForRPM(ctx, acc, false) {
 				continue
 			}
-			if selected == nil {
+			if s.isBetterLegacyCandidate(acc, selected, preferOAuth && acc.Platform == PlatformGemini && selected != nil && selected.Platform == PlatformGemini) {
 				selected = acc
-				continue
-			}
-			if acc.Priority < selected.Priority {
-				selected = acc
-			} else if acc.Priority == selected.Priority {
-				switch {
-				case acc.LastUsedAt == nil && selected.LastUsedAt != nil:
-					selected = acc
-				case acc.LastUsedAt != nil && selected.LastUsedAt == nil:
-					// keep selected (never used is preferred)
-				case acc.LastUsedAt == nil && selected.LastUsedAt == nil:
-					if preferOAuth && acc.Platform == PlatformGemini && selected.Platform == PlatformGemini && acc.Type != selected.Type && acc.Type == AccountTypeOAuth {
-						selected = acc
-					}
-				default:
-					if acc.LastUsedAt.Before(*selected.LastUsedAt) {
-						selected = acc
-					}
-				}
 			}
 		}
 
@@ -3181,27 +3408,8 @@ func (s *GatewayService) selectAccountWithMixedScheduling(ctx context.Context, g
 		if !s.isAccountSchedulableForRPM(ctx, acc, false) {
 			continue
 		}
-		if selected == nil {
+		if s.isBetterLegacyCandidate(acc, selected, preferOAuth && acc.Platform == PlatformGemini && selected != nil && selected.Platform == PlatformGemini) {
 			selected = acc
-			continue
-		}
-		if acc.Priority < selected.Priority {
-			selected = acc
-		} else if acc.Priority == selected.Priority {
-			switch {
-			case acc.LastUsedAt == nil && selected.LastUsedAt != nil:
-				selected = acc
-			case acc.LastUsedAt != nil && selected.LastUsedAt == nil:
-				// keep selected (never used is preferred)
-			case acc.LastUsedAt == nil && selected.LastUsedAt == nil:
-				if preferOAuth && acc.Platform == PlatformGemini && selected.Platform == PlatformGemini && acc.Type != selected.Type && acc.Type == AccountTypeOAuth {
-					selected = acc
-				}
-			default:
-				if acc.LastUsedAt.Before(*selected.LastUsedAt) {
-					selected = acc
-				}
-			}
 		}
 	}
 

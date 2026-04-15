@@ -168,6 +168,21 @@ func (s *SchedulerSnapshotService) UpdateAccountInCache(ctx context.Context, acc
 	return s.cache.SetAccount(ctx, account)
 }
 
+// TouchAccountLastUsed updates the scheduler cache view of an account's last_used_at
+// immediately, so selection can react before the deferred DB flush/outbox path finishes.
+func (s *SchedulerSnapshotService) TouchAccountLastUsed(ctx context.Context, accountID int64, usedAt time.Time) error {
+	if s == nil || s.cache == nil || accountID <= 0 {
+		return nil
+	}
+	if usedAt.IsZero() {
+		usedAt = time.Now()
+	}
+	updates := map[int64]time.Time{
+		accountID: usedAt,
+	}
+	return s.cache.UpdateLastUsed(ctx, updates)
+}
+
 func (s *SchedulerSnapshotService) runInitialRebuild() {
 	if s.cache == nil {
 		return

@@ -104,7 +104,7 @@ func (s *stubAntigravityAccountRepo) UpdateExtra(ctx context.Context, id int64, 
 	return nil
 }
 
-func TestAntigravityRetryLoop_NoURLFallback_UsesConfiguredBaseURL(t *testing.T) {
+func TestAntigravityRetryLoop_URLFallback_UsesNextAvailableBaseURL(t *testing.T) {
 	t.Setenv(antigravityForwardBaseURLEnv, "")
 
 	oldBaseURLs := append([]string(nil), antigravity.BaseURLs...)
@@ -114,12 +114,12 @@ func TestAntigravityRetryLoop_NoURLFallback_UsesConfiguredBaseURL(t *testing.T) 
 		antigravity.DefaultURLAvailability = oldAvailability
 	}()
 
-	base1 := "https://ag-1.test"
-	base2 := "https://ag-2.test"
-	antigravity.BaseURLs = []string{base1, base2}
+	dailyBase := "https://ag-daily.test"
+	prodBase := "https://ag-prod.test"
+	antigravity.BaseURLs = []string{dailyBase, prodBase}
 	antigravity.DefaultURLAvailability = antigravity.NewURLAvailability(time.Minute)
 
-	upstream := &stubAntigravityUpstream{firstBase: base1, secondBase: base2}
+	upstream := &stubAntigravityUpstream{firstBase: dailyBase, secondBase: prodBase}
 	account := &Account{
 		ID:          1,
 		Name:        "acc-1",
@@ -151,16 +151,15 @@ func TestAntigravityRetryLoop_NoURLFallback_UsesConfiguredBaseURL(t *testing.T) 
 	require.NotNil(t, result)
 	require.NotNil(t, result.resp)
 	defer func() { _ = result.resp.Body.Close() }()
-	require.Equal(t, http.StatusTooManyRequests, result.resp.StatusCode)
-	require.True(t, handleErrorCalled)
-	require.Len(t, upstream.calls, antigravityMaxRetries)
-	for _, callURL := range upstream.calls {
-		require.True(t, strings.HasPrefix(callURL, base1))
-	}
+	require.Equal(t, http.StatusOK, result.resp.StatusCode)
+	require.False(t, handleErrorCalled)
+	require.Len(t, upstream.calls, 2)
+	require.True(t, strings.HasPrefix(upstream.calls[0], dailyBase))
+	require.True(t, strings.HasPrefix(upstream.calls[1], prodBase))
+	require.False(t, antigravity.DefaultURLAvailability.IsAvailable(dailyBase))
 
-	available := antigravity.DefaultURLAvailability.GetAvailableURLs()
-	require.NotEmpty(t, available)
-	require.Equal(t, base1, available[0])
+	available := resolveAntigravityForwardBaseURLs()
+	require.Equal(t, []string{prodBase}, available)
 }
 
 // TestHandleUpstreamError_429_ModelRateLimit 测试 429 模型限流场景
@@ -964,20 +963,84 @@ func TestIsAntigravityAccountSwitchError(t *testing.T) {
 	}
 }
 
-func TestResolveAntigravityForwardBaseURL_DefaultDaily(t *testing.T) {
+func TestResolveAntigravityForwardBaseURLs_DefaultDailyFirst(t *testing.T) {
 	t.Setenv(antigravityForwardBaseURLEnv, "")
 
 	oldBaseURLs := append([]string(nil), antigravity.BaseURLs...)
+	oldAvailability := antigravity.DefaultURLAvailability
 	defer func() {
 		antigravity.BaseURLs = oldBaseURLs
+		antigravity.DefaultURLAvailability = oldAvailability
 	}()
 
-	prodURL := "https://prod.test"
 	dailyURL := "https://daily.test"
+	prodURL := "https://prod.test"
 	antigravity.BaseURLs = []string{dailyURL, prodURL}
+	antigravity.DefaultURLAvailability = antigravity.NewURLAvailability(time.Minute)
 
-	resolved := resolveAntigravityForwardBaseURL()
-	require.Equal(t, dailyURL, resolved)
+	resolved := resolveAntigravityForwardBaseURLs()
+	require.Equal(t, []string{dailyURL, prodURL}, resolved)
+}
+
+func TestResolveAntigravityForwardBaseURLs_ProdFirstWhenRequested(t *testing.T) {
+	t.Setenv(antigravityForwardBaseURLEnv, "prod")
+
+	oldBaseURLs := append([]string(nil), antigravity.BaseURLs...)
+	oldAvailability := antigravity.DefaultURLAvailability
+	defer func() {
+		antigravity.BaseURLs = oldBaseURLs
+		antigravity.DefaultURLAvailability = oldAvailability
+	}()
+
+	dailyURL := "https://daily.test"
+	prodURL := "https://prod.test"
+	antigravity.BaseURLs = []string{dailyURL, prodURL}
+	antigravity.DefaultURLAvailability = antigravity.NewURLAvailability(time.Minute)
+
+	resolved := resolveAntigravityForwardBaseURLs()
+	require.Equal(t, []string{prodURL, dailyURL}, resolved)
+}
+
+func TestResolveAntigravityForwardBaseURLs_SkipsUnavailableAndPrefersLastSuccess(t *testing.T) {
+	t.Setenv(antigravityForwardBaseURLEnv, "")
+
+	oldBaseURLs := append([]string(nil), antigravity.BaseURLs...)
+	oldAvailability := antigravity.DefaultURLAvailability
+	defer func() {
+		antigravity.BaseURLs = oldBaseURLs
+		antigravity.DefaultURLAvailability = oldAvailability
+	}()
+
+	dailyURL := "https://daily.test"
+	prodURL := "https://prod.test"
+	antigravity.BaseURLs = []string{dailyURL, prodURL}
+	antigravity.DefaultURLAvailability = antigravity.NewURLAvailability(time.Minute)
+	antigravity.DefaultURLAvailability.MarkSuccess(prodURL)
+	antigravity.DefaultURLAvailability.MarkUnavailable(dailyURL)
+
+	resolved := resolveAntigravityForwardBaseURLs()
+	require.Equal(t, []string{prodURL}, resolved)
+}
+
+func TestResolveAntigravityForwardBaseURLs_AllUnavailableFallsBackToConfiguredOrder(t *testing.T) {
+	t.Setenv(antigravityForwardBaseURLEnv, "")
+
+	oldBaseURLs := append([]string(nil), antigravity.BaseURLs...)
+	oldAvailability := antigravity.DefaultURLAvailability
+	defer func() {
+		antigravity.BaseURLs = oldBaseURLs
+		antigravity.DefaultURLAvailability = oldAvailability
+	}()
+
+	dailyURL := "https://daily.test"
+	prodURL := "https://prod.test"
+	antigravity.BaseURLs = []string{dailyURL, prodURL}
+	antigravity.DefaultURLAvailability = antigravity.NewURLAvailability(time.Minute)
+	antigravity.DefaultURLAvailability.MarkUnavailable(prodURL)
+	antigravity.DefaultURLAvailability.MarkUnavailable(dailyURL)
+
+	resolved := resolveAntigravityForwardBaseURLs()
+	require.Equal(t, []string{dailyURL, prodURL}, resolved)
 }
 
 func TestAntigravityAccountSwitchError_Error(t *testing.T) {

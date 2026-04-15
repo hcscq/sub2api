@@ -44,8 +44,9 @@ const (
 
 	// MODEL_CAPACITY_EXHAUSTED 专用重试参数
 	// 模型容量不足时，所有账号共享同一容量池，切换账号无意义
-	// 使用固定 1s 间隔重试，最多重试 60 次
-	antigravityModelCapacityRetryMaxAttempts = 60
+	// 使用固定 1s 间隔做少量原地重试，避免在单账号上卡住过久。
+	// 更长的退避交给 handler 层的切号/单账号回退循环处理。
+	antigravityModelCapacityRetryMaxAttempts = 3
 	antigravityModelCapacityRetryWait        = 1 * time.Second
 
 	// Google RPC 状态和类型常量
@@ -148,16 +149,34 @@ type antigravityRetryLoopResult struct {
 	resp *http.Response
 }
 
-// resolveAntigravityForwardBaseURL 解析转发用 base URL。
-// 默认使用 daily（ForwardBaseURLs 的首个地址）；当环境变量为 prod 时使用第二个地址。
-func resolveAntigravityForwardBaseURL() string {
+// resolveAntigravityForwardBaseURLs 解析转发用 base URL 列表。
+// 默认使用 daily-first；当环境变量为 prod 时将 daily 调整到最后。
+// 会优先返回 URLAvailability 中最近成功且当前可用的地址；
+// 若所有 URL 都被临时屏蔽，则回退到配置顺序，避免因状态缓存导致整体不可用。
+func resolveAntigravityForwardBaseURLs() []string {
 	baseURLs := antigravity.ForwardBaseURLs()
 	if len(baseURLs) == 0 {
-		return ""
+		return nil
 	}
 	mode := strings.ToLower(strings.TrimSpace(os.Getenv(antigravityForwardBaseURLEnv)))
 	if mode == "prod" && len(baseURLs) > 1 {
-		return baseURLs[1]
+		baseURLs = append(append([]string(nil), baseURLs[1:]...), baseURLs[0])
+	}
+	if antigravity.DefaultURLAvailability == nil {
+		return baseURLs
+	}
+	availableURLs := antigravity.DefaultURLAvailability.GetAvailableURLsWithBase(baseURLs)
+	if len(availableURLs) > 0 {
+		return availableURLs
+	}
+	return baseURLs
+}
+
+// resolveAntigravityForwardBaseURL 返回首选转发 URL，保留给仍按单 URL 读取的调用方。
+func resolveAntigravityForwardBaseURL() string {
+	baseURLs := resolveAntigravityForwardBaseURLs()
+	if len(baseURLs) == 0 {
+		return ""
 	}
 	return baseURLs[0]
 }
@@ -184,6 +203,9 @@ type smartRetryResult struct {
 func (s *AntigravityGatewayService) handleSmartRetry(p antigravityRetryLoopParams, resp *http.Response, respBody []byte, baseURL string, urlIdx int, availableURLs []string) *smartRetryResult {
 	// "Resource has been exhausted" 是 URL 级别限流，切换 URL（仅 429）
 	if resp.StatusCode == http.StatusTooManyRequests && isURLLevelRateLimit(respBody) && urlIdx < len(availableURLs)-1 {
+		if antigravity.DefaultURLAvailability != nil {
+			antigravity.DefaultURLAvailability.MarkUnavailable(baseURL)
+		}
 		logger.LegacyPrintf("service.antigravity_gateway", "%s URL fallback (429): %s -> %s", p.prefix, baseURL, availableURLs[urlIdx+1])
 		return &smartRetryResult{action: smartRetryActionContinueURL}
 	}
@@ -251,7 +273,7 @@ func (s *AntigravityGatewayService) handleSmartRetry(p antigravityRetryLoopParam
 		var lastRetryResp *http.Response
 		var lastRetryBody []byte
 
-		// MODEL_CAPACITY_EXHAUSTED 使用独立的重试参数（60 次，固定 1s 间隔）
+		// MODEL_CAPACITY_EXHAUSTED 使用独立的重试参数（少量固定 1s 间隔重试）
 		maxAttempts := antigravitySmartRetryMaxAttempts
 		if isModelCapacityExhausted {
 			maxAttempts = antigravityModelCapacityRetryMaxAttempts
@@ -591,11 +613,10 @@ func (s *AntigravityGatewayService) antigravityRetryLoop(p antigravityRetryLoopP
 		}
 	}
 
-	baseURL := resolveAntigravityForwardBaseURL()
-	if baseURL == "" {
+	availableURLs := resolveAntigravityForwardBaseURLs()
+	if len(availableURLs) == 0 {
 		return nil, errors.New("no antigravity forward base url configured")
 	}
-	availableURLs := []string{baseURL}
 
 	var resp *http.Response
 	var usedBaseURL string
@@ -649,6 +670,9 @@ urlFallbackLoop:
 					Message:            safeErr,
 				})
 				if shouldAntigravityFallbackToNextURL(err, 0) && urlIdx < len(availableURLs)-1 {
+					if antigravity.DefaultURLAvailability != nil {
+						antigravity.DefaultURLAvailability.MarkUnavailable(baseURL)
+					}
 					logger.LegacyPrintf("service.antigravity_gateway", "%s URL fallback (connection error): %s -> %s", p.prefix, baseURL, availableURLs[urlIdx+1])
 					continue urlFallbackLoop
 				}

@@ -401,6 +401,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			// 记录 Forward 前已写入字节数，Forward 后若增加则说明 SSE 内容已发，禁止 failover
 			writerSizeBeforeForward := c.Writer.Size()
 			if account.Platform == service.PlatformAntigravity {
+				h.gatewayService.MarkAntigravitySelectionAttempt(requestCtx, account)
 				result, err = h.antigravityGatewayService.ForwardGemini(requestCtx, c, account, reqModel, "generateContent", reqStream, body, hasBoundSession)
 			} else {
 				result, err = h.geminiCompatService.Forward(requestCtx, c, account, body)
@@ -411,6 +412,9 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			if err != nil {
 				var failoverErr *service.UpstreamFailoverError
 				if errors.As(err, &failoverErr) {
+					if account.Platform == service.PlatformAntigravity {
+						h.gatewayService.ReportAntigravityResult(account.ID, false, nil)
+					}
 					// 流式内容已写入客户端，无法撤销，禁止 failover 以防止流拼接腐化
 					if c.Writer.Size() != writerSizeBeforeForward {
 						h.handleFailoverExhausted(c, failoverErr, service.PlatformGemini, true)
@@ -426,6 +430,9 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 					case FailoverCanceled:
 						return
 					}
+				}
+				if account.Platform == service.PlatformAntigravity {
+					h.gatewayService.ReportAntigravityResult(account.ID, false, nil)
 				}
 				wroteFallback := h.ensureForwardErrorResponse(c, streamStarted)
 				forwardFailedFields := []zap.Field{
@@ -447,6 +454,9 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 				}
 				reqLog.Error("gateway.forward_failed", forwardFailedFields...)
 				return
+			}
+			if account.Platform == service.PlatformAntigravity {
+				h.gatewayService.ReportAntigravityResult(account.ID, true, result.FirstTokenMs)
 			}
 
 			// RPM 计数递增（Forward 成功后）
@@ -685,6 +695,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			// 记录 Forward 前已写入字节数，Forward 后若增加则说明 SSE 内容已发，禁止 failover
 			writerSizeBeforeForward := c.Writer.Size()
 			if account.Platform == service.PlatformAntigravity && account.Type != service.AccountTypeAPIKey {
+				h.gatewayService.MarkAntigravitySelectionAttempt(requestCtx, account)
 				result, err = h.antigravityGatewayService.Forward(requestCtx, c, account, body, hasBoundSession)
 			} else {
 				result, err = h.gatewayService.Forward(requestCtx, c, account, parsedReq)
@@ -753,6 +764,9 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 				}
 				var failoverErr *service.UpstreamFailoverError
 				if errors.As(err, &failoverErr) {
+					if account.Platform == service.PlatformAntigravity {
+						h.gatewayService.ReportAntigravityResult(account.ID, false, nil)
+					}
 					// 流式内容已写入客户端，无法撤销，禁止 failover 以防止流拼接腐化
 					if c.Writer.Size() != writerSizeBeforeForward {
 						h.handleFailoverExhausted(c, failoverErr, account.Platform, true)
@@ -768,6 +782,9 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 					case FailoverCanceled:
 						return
 					}
+				}
+				if account.Platform == service.PlatformAntigravity {
+					h.gatewayService.ReportAntigravityResult(account.ID, false, nil)
 				}
 				wroteFallback := h.ensureForwardErrorResponse(c, streamStarted)
 				forwardFailedFields := []zap.Field{
@@ -789,6 +806,9 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 				}
 				reqLog.Error("gateway.forward_failed", forwardFailedFields...)
 				return
+			}
+			if account.Platform == service.PlatformAntigravity {
+				h.gatewayService.ReportAntigravityResult(account.ID, true, result.FirstTokenMs)
 			}
 
 			// RPM 计数递增（Forward 成功后）

@@ -39,7 +39,17 @@ func (s *DeferredService) Stop() {
 }
 
 func (s *DeferredService) ScheduleLastUsedUpdate(accountID int64) {
-	s.lastUsedUpdates.Store(accountID, time.Now())
+	s.ScheduleLastUsedUpdateAt(accountID, time.Now())
+}
+
+func (s *DeferredService) ScheduleLastUsedUpdateAt(accountID int64, usedAt time.Time) {
+	if accountID <= 0 {
+		return
+	}
+	if usedAt.IsZero() {
+		usedAt = time.Now()
+	}
+	s.lastUsedUpdates.Store(accountID, usedAt)
 }
 
 func (s *DeferredService) flushLastUsed() {
