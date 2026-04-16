@@ -172,15 +172,6 @@ func resolveAntigravityForwardBaseURLs() []string {
 	return baseURLs
 }
 
-// resolveAntigravityForwardBaseURL 返回首选转发 URL，保留给仍按单 URL 读取的调用方。
-func resolveAntigravityForwardBaseURL() string {
-	baseURLs := resolveAntigravityForwardBaseURLs()
-	if len(baseURLs) == 0 {
-		return ""
-	}
-	return baseURLs[0]
-}
-
 // smartRetryAction 智能重试的处理结果
 type smartRetryAction int
 

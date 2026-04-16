@@ -1621,14 +1621,11 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 
 			// 3. 按负载感知排序
 			var routingAvailable []accountWithLoad
-			var routingWaitCandidates []accountWithLoad
 			for _, acc := range routingCandidates {
 				loadInfo := loadInfoOrDefault(routingLoadMap, acc.ID)
-				item := accountWithLoad{account: acc, loadInfo: loadInfo}
-				routingWaitCandidates = append(routingWaitCandidates, item)
 				// WaitingCount 会放大 LoadRate；是否还能立即抢到真实并发槽位，必须看当前占用数。
 				if hasImmediateConcurrencyCapacity(loadInfo, acc.EffectiveLoadFactor()) {
-					routingAvailable = append(routingAvailable, item)
+					routingAvailable = append(routingAvailable, accountWithLoad{account: acc, loadInfo: loadInfo})
 				}
 			}
 
@@ -1684,16 +1681,10 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 
 			}
 
-			// 5. 所有路由账号暂无可立即获取的槽位，按当前等待深度选择排队目标，
-			// 避免少账号场景下把所有请求都压到同一个账号的等待队列。
-			if len(routingWaitCandidates) > 0 {
-				if platform == PlatformAntigravity {
-					routingWaitCandidates = s.preferDirectAntigravityAccountLoads(ctx, routingWaitCandidates, requestedModel)
-				}
-				sort.SliceStable(routingWaitCandidates, func(i, j int) bool {
-					return s.lessWaitCandidate(ctx, requestedModel, preferOAuth, routingWaitCandidates[i], routingWaitCandidates[j])
-				})
-				for _, item := range routingWaitCandidates {
+			// 5. 路由账号仍有真实槽位但在获取时被并发抢占，返回等待计划。
+			// 若所有路由账号都已真正满载，则继续回退到 Layer 2 普通选择。
+			if len(routingAvailable) > 0 {
+				for _, item := range routingAvailable {
 					if !s.checkAndRegisterSession(ctx, item.account, sessionHash) {
 						continue // 会话限制已满，尝试下一个
 					}
