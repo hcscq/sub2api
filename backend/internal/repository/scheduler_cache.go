@@ -421,6 +421,7 @@ func filterSchedulerExtra(extra map[string]any) map[string]any {
 		return nil
 	}
 	keys := []string{
+		"allow_overages",
 		"mixed_scheduling",
 		"window_cost_limit",
 		"window_cost_sticky_reserve",
@@ -433,6 +434,39 @@ func filterSchedulerExtra(extra map[string]any) map[string]any {
 			filtered[key] = value
 		}
 	}
+	if modelRateLimits := filterSchedulerModelRateLimits(extra); len(modelRateLimits) > 0 {
+		filtered["model_rate_limits"] = modelRateLimits
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	return filtered
+}
+
+func filterSchedulerModelRateLimits(extra map[string]any) map[string]any {
+	rawLimits, ok := extra["model_rate_limits"].(map[string]any)
+	if !ok || len(rawLimits) == 0 {
+		return nil
+	}
+
+	filtered := make(map[string]any)
+	for scope, rawLimit := range rawLimits {
+		limit, ok := rawLimit.(map[string]any)
+		if !ok {
+			continue
+		}
+		resetAtRaw, ok := limit["rate_limit_reset_at"].(string)
+		if !ok || resetAtRaw == "" {
+			continue
+		}
+		if _, err := time.Parse(time.RFC3339, resetAtRaw); err != nil {
+			continue
+		}
+		filtered[scope] = map[string]any{
+			"rate_limit_reset_at": resetAtRaw,
+		}
+	}
+
 	if len(filtered) == 0 {
 		return nil
 	}

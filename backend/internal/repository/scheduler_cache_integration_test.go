@@ -44,11 +44,22 @@ func TestSchedulerCacheSnapshotUsesSlimMetadataButKeepsFullAccount(t *testing.T)
 		},
 		Extra: map[string]any{
 			"mixed_scheduling":             true,
+			"allow_overages":               true,
 			"window_cost_limit":            12.5,
 			"window_cost_sticky_reserve":   8.0,
 			"max_sessions":                 4,
 			"session_idle_timeout_minutes": 11,
-			"unused_large_field":           strings.Repeat("y", 4096),
+			"model_rate_limits": map[string]any{
+				"gemini-2.5-pro": map[string]any{
+					"rate_limited_at":     now.Add(-2 * time.Minute).Format(time.RFC3339),
+					"rate_limit_reset_at": limitReset.Format(time.RFC3339),
+					"retry_after_ms":      60000,
+				},
+				"invalid-scope": map[string]any{
+					"rate_limit_reset_at": "not-a-time",
+				},
+			},
+			"unused_large_field": strings.Repeat("y", 4096),
 		},
 		RateLimitResetAt:       &limitReset,
 		OverloadUntil:          &overloadUntil,
@@ -74,15 +85,32 @@ func TestSchedulerCacheSnapshotUsesSlimMetadataButKeepsFullAccount(t *testing.T)
 	require.Empty(t, got.GetCredential("access_token"))
 	require.Empty(t, got.GetCredential("huge_blob"))
 	require.Equal(t, true, got.Extra["mixed_scheduling"])
+	require.Equal(t, true, got.Extra["allow_overages"])
 	require.Equal(t, 12.5, got.GetWindowCostLimit())
 	require.Equal(t, 8.0, got.GetWindowCostStickyReserve())
 	require.Equal(t, 4, got.GetMaxSessions())
 	require.Equal(t, 11, got.GetSessionIdleTimeoutMinutes())
 	require.Nil(t, got.Extra["unused_large_field"])
+	snapshotModelRateLimits, ok := got.Extra["model_rate_limits"].(map[string]any)
+	require.True(t, ok)
+	require.Len(t, snapshotModelRateLimits, 1)
+	snapshotScopeLimit, ok := snapshotModelRateLimits["gemini-2.5-pro"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, limitReset.Format(time.RFC3339), snapshotScopeLimit["rate_limit_reset_at"])
+	require.NotContains(t, snapshotScopeLimit, "rate_limited_at")
+	require.NotContains(t, snapshotScopeLimit, "retry_after_ms")
 
 	full, err := cache.GetAccount(ctx, account.ID)
 	require.NoError(t, err)
 	require.NotNil(t, full)
 	require.Equal(t, "secret-access-token", full.GetCredential("access_token"))
 	require.Equal(t, strings.Repeat("x", 4096), full.GetCredential("huge_blob"))
+	require.Equal(t, strings.Repeat("y", 4096), full.Extra["unused_large_field"])
+	fullModelRateLimits, ok := full.Extra["model_rate_limits"].(map[string]any)
+	require.True(t, ok)
+	fullScopeLimit, ok := fullModelRateLimits["gemini-2.5-pro"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, limitReset.Format(time.RFC3339), fullScopeLimit["rate_limit_reset_at"])
+	require.Contains(t, fullScopeLimit, "rate_limited_at")
+	require.Contains(t, fullScopeLimit, "retry_after_ms")
 }
