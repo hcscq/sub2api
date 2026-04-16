@@ -253,6 +253,33 @@ func TestHandleUpstreamError_503_ModelCapacityExhausted(t *testing.T) {
 	require.Empty(t, repo.modelRateLimitCalls, "MODEL_CAPACITY_EXHAUSTED should not set model rate limit")
 }
 
+func TestHandleUpstreamError_503_ModelCapacityExhausted_FinalRetryBody(t *testing.T) {
+	repo := &stubAntigravityAccountRepo{}
+	svc := &AntigravityGatewayService{accountRepo: repo}
+	account := &Account{ID: 301, Name: "acc-301", Platform: PlatformAntigravity}
+
+	// smart retry 耗尽后，外层仍保持 503，但最终重试响应体可能退化为 429/message。
+	body := []byte(`{
+		"error": {
+			"code": 429,
+			"status": "RESOURCE_EXHAUSTED",
+			"details": [
+				{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "metadata": {"model": "gemini-3-pro-high"}, "reason": "RATE_LIMIT_EXCEEDED"},
+				{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "1s"}
+			],
+			"message": "You have exhausted your capacity on this model. Your quota will reset after 1s."
+		}
+	}`)
+
+	result := svc.handleUpstreamError(context.Background(), "[test]", account, http.StatusServiceUnavailable, http.Header{}, body, "gemini-3-pro-high", 0, "", false)
+
+	require.NotNil(t, result)
+	require.True(t, result.Handled)
+	require.False(t, result.ShouldRetry)
+	require.Nil(t, result.SwitchError, "final retry body from shared capacity exhaustion should not trigger account switch")
+	require.Empty(t, repo.modelRateLimitCalls, "shared model capacity exhaustion should not set model rate limit")
+}
+
 // TestHandleUpstreamError_503_NonModelRateLimit 测试 503 非模型限流场景（不处理）
 func TestHandleUpstreamError_503_NonModelRateLimit(t *testing.T) {
 	repo := &stubAntigravityAccountRepo{}

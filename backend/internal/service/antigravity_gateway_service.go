@@ -2521,8 +2521,29 @@ func isAntigravityModelCapacityExhaustedResponse(statusCode int, bodies ...[]byt
 		if info := parseAntigravitySmartRetryInfo(body); info != nil && info.IsModelCapacityExhausted {
 			return true
 		}
+		if isAntigravityModelCapacityFallbackBody(body) {
+			return true
+		}
 	}
 	return false
+}
+
+// isAntigravityModelCapacityFallbackBody 处理 smart retry 耗尽后的最终响应体识别缺口。
+// 该路径下外层 HTTP 状态仍为 503，但最后一次重试返回体可能已退化为 429 RESOURCE_EXHAUSTED
+// 或仅保留容量不足文本，此时仍应视为共享模型容量耗尽，避免错误切号。
+func isAntigravityModelCapacityFallbackBody(body []byte) bool {
+	status := strings.TrimSpace(gjson.GetBytes(body, "error.status").String())
+	if status != "" && status != googleRPCStatusUnavailable && status != googleRPCStatusResourceExhausted {
+		return false
+	}
+
+	message := strings.ToLower(strings.TrimSpace(extractAntigravityErrorMessage(body)))
+	if message == "" {
+		return false
+	}
+
+	return strings.Contains(message, "no capacity available for model") ||
+		strings.Contains(message, "exhausted your capacity on this model")
 }
 
 // isGoogleProjectConfigError 判断（已提取的小写）错误消息是否属于 Google 服务端配置类问题。
@@ -2823,7 +2844,15 @@ func (s *AntigravityGatewayService) handleModelRateLimit(p *handleModelRateLimit
 	}
 
 	info := parseAntigravitySmartRetryInfo(p.body)
-	if info == nil || info.ModelName == "" {
+	if p.statusCode == http.StatusServiceUnavailable && isAntigravityModelCapacityExhaustedResponse(p.statusCode, p.body) {
+		if info != nil {
+			info.IsModelCapacityExhausted = true
+		} else {
+			info = &antigravitySmartRetryInfo{IsModelCapacityExhausted: true}
+		}
+	}
+
+	if info == nil {
 		return &handleModelRateLimitResult{Handled: false}
 	}
 
@@ -2835,6 +2864,10 @@ func (s *AntigravityGatewayService) handleModelRateLimit(p *handleModelRateLimit
 		return &handleModelRateLimitResult{
 			Handled: true,
 		}
+	}
+
+	if info.ModelName == "" {
+		return &handleModelRateLimitResult{Handled: false}
 	}
 
 	// RATE_LIMIT_EXCEEDED: < antigravityRateLimitThreshold: 等待后重试

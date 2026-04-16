@@ -461,6 +461,86 @@ func TestAntigravityGatewayService_Forward_ModelCapacityExhaustedMarksFailover(t
 	require.True(t, failoverErr.ModelCapacityExhausted)
 }
 
+func TestAntigravityGatewayService_Forward_ModelCapacityExhaustedFinalRetryBodyMarksFailover(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	writer := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(writer)
+
+	body, err := json.Marshal(map[string]any{
+		"model":      "claude-sonnet-4-5",
+		"messages":   []map[string]string{{"role": "user", "content": "hello"}},
+		"max_tokens": 32,
+	})
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	c.Request = req
+
+	initial503Body := `{
+		"error": {
+			"code": 503,
+			"status": "UNAVAILABLE",
+			"details": [
+				{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "metadata": {"model": "claude-sonnet-4-5"}, "reason": "MODEL_CAPACITY_EXHAUSTED"},
+				{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "1s"}
+			],
+			"message": "No capacity available for model claude-sonnet-4-5 on the server"
+		}
+	}`
+	finalRetryBody := `{
+		"error": {
+			"code": 429,
+			"status": "RESOURCE_EXHAUSTED",
+			"details": [
+				{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "metadata": {"model": "claude-sonnet-4-5"}, "reason": "RATE_LIMIT_EXCEEDED"},
+				{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "1s"}
+			],
+			"message": "You have exhausted your capacity on this model. Your quota will reset after 1s."
+		}
+	}`
+	upstream := &queuedHTTPUpstreamStub{
+		responses: []*http.Response{
+			newQueuedAntigravityErrorResponses(1, http.StatusServiceUnavailable, initial503Body)[0],
+			newQueuedAntigravityErrorResponses(1, http.StatusTooManyRequests, finalRetryBody)[0],
+			newQueuedAntigravityErrorResponses(1, http.StatusTooManyRequests, finalRetryBody)[0],
+			newQueuedAntigravityErrorResponses(1, http.StatusTooManyRequests, finalRetryBody)[0],
+		},
+	}
+	svc := &AntigravityGatewayService{
+		tokenProvider: &AntigravityTokenProvider{},
+		httpUpstream:  upstream,
+	}
+	account := &Account{
+		ID:          302,
+		Name:        "acc-model-capacity-final-body",
+		Platform:    PlatformAntigravity,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"access_token": "token",
+		},
+	}
+
+	modelCapacityExhaustedMu.Lock()
+	delete(modelCapacityExhaustedUntil, "claude-sonnet-4-5")
+	modelCapacityExhaustedMu.Unlock()
+	t.Cleanup(func() {
+		modelCapacityExhaustedMu.Lock()
+		delete(modelCapacityExhaustedUntil, "claude-sonnet-4-5")
+		modelCapacityExhaustedMu.Unlock()
+	})
+
+	result, err := svc.Forward(context.Background(), c, account, body, false)
+	require.Nil(t, result)
+	require.Error(t, err)
+
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, http.StatusServiceUnavailable, failoverErr.StatusCode)
+	require.True(t, failoverErr.ModelCapacityExhausted, "503 model-capacity retry exhaustion should stay on shared-capacity path even if final retry body is 429")
+}
+
 func TestAntigravityGatewayService_ForwardGemini_ModelCapacityExhaustedMarksFailover(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	writer := httptest.NewRecorder()
