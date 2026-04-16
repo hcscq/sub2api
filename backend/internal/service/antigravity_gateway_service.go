@@ -364,23 +364,43 @@ func (s *AntigravityGatewayService) handleSmartRetry(p antigravityRetryLoopParam
 		if retryBody == nil {
 			retryBody = respBody
 		}
+		finalStatusCode := resp.StatusCode
+		finalHeaders := resp.Header.Clone()
+		if lastRetryResp != nil {
+			finalStatusCode = lastRetryResp.StatusCode
+			finalHeaders = lastRetryResp.Header.Clone()
+		}
+		finalModelName := modelName
+		finalIsModelCapacityExhausted := isModelCapacityExhausted
+		if finalShouldRetry, finalShouldRateLimitModel, finalWaitDuration, finalModel, finalIsMCE := shouldTriggerAntigravitySmartRetry(p.account, retryBody); finalShouldRetry || finalShouldRateLimitModel || finalIsMCE {
+			if finalWaitDuration > 0 {
+				rateLimitDuration = finalWaitDuration
+			}
+			if strings.TrimSpace(finalModel) != "" {
+				finalModelName = finalModel
+			}
+			finalIsModelCapacityExhausted = finalIsMCE
+		}
+		if rateLimitDuration <= 0 {
+			rateLimitDuration = antigravityDefaultRateLimitDuration
+		}
 
 		// MODEL_CAPACITY_EXHAUSTED：模型容量不足，切换账号无意义
 		// 直接返回上游错误响应，不设置模型限流，不切换账号
-		if isModelCapacityExhausted {
+		if finalIsModelCapacityExhausted {
 			// 设置 cooldown，让后续请求快速失败，避免重复重试
-			if modelName != "" {
+			if finalModelName != "" {
 				modelCapacityExhaustedMu.Lock()
-				modelCapacityExhaustedUntil[modelName] = time.Now().Add(antigravityModelCapacityCooldown)
+				modelCapacityExhaustedUntil[finalModelName] = time.Now().Add(antigravityModelCapacityCooldown)
 				modelCapacityExhaustedMu.Unlock()
 			}
 			log.Printf("%s status=%d smart_retry_exhausted_model_capacity attempts=%d model=%s account=%d body=%s (model capacity exhausted, not switching account)",
-				p.prefix, resp.StatusCode, maxAttempts, modelName, p.account.ID, truncateForLog(retryBody, 200))
+				p.prefix, finalStatusCode, maxAttempts, finalModelName, p.account.ID, truncateForLog(retryBody, 200))
 			return &smartRetryResult{
 				action: smartRetryActionBreakWithResp,
 				resp: &http.Response{
-					StatusCode: resp.StatusCode,
-					Header:     resp.Header.Clone(),
+					StatusCode: finalStatusCode,
+					Header:     finalHeaders,
 					Body:       io.NopCloser(bytes.NewReader(retryBody)),
 				},
 			}
@@ -388,30 +408,30 @@ func (s *AntigravityGatewayService) handleSmartRetry(p antigravityRetryLoopParam
 
 		// 单账号 503 退避重试模式：智能重试耗尽后不设限流、不切换账号，
 		// 直接返回 503 让 Handler 层的单账号退避循环做最终处理。
-		if resp.StatusCode == http.StatusServiceUnavailable && isSingleAccountRetry(p.ctx) {
+		if finalStatusCode == http.StatusServiceUnavailable && isSingleAccountRetry(p.ctx) {
 			logger.LegacyPrintf("service.antigravity_gateway", "%s status=%d smart_retry_exhausted_single_account attempts=%d model=%s account=%d body=%s (return 503 directly)",
-				p.prefix, resp.StatusCode, antigravitySmartRetryMaxAttempts, modelName, p.account.ID, truncateForLog(retryBody, 200))
+				p.prefix, finalStatusCode, antigravitySmartRetryMaxAttempts, finalModelName, p.account.ID, truncateForLog(retryBody, 200))
 			return &smartRetryResult{
 				action: smartRetryActionBreakWithResp,
 				resp: &http.Response{
-					StatusCode: resp.StatusCode,
-					Header:     resp.Header.Clone(),
+					StatusCode: finalStatusCode,
+					Header:     finalHeaders,
 					Body:       io.NopCloser(bytes.NewReader(retryBody)),
 				},
 			}
 		}
 
 		log.Printf("%s status=%d smart_retry_exhausted attempts=%d model=%s account=%d upstream_retry_delay=%v body=%s (switch account)",
-			p.prefix, resp.StatusCode, maxAttempts, modelName, p.account.ID, rateLimitDuration, truncateForLog(retryBody, 200))
+			p.prefix, finalStatusCode, maxAttempts, finalModelName, p.account.ID, rateLimitDuration, truncateForLog(retryBody, 200))
 
 		resetAt := time.Now().Add(rateLimitDuration)
-		if p.accountRepo != nil && modelName != "" {
-			if err := p.accountRepo.SetModelRateLimit(p.ctx, p.account.ID, modelName, resetAt); err != nil {
-				logger.LegacyPrintf("service.antigravity_gateway", "%s status=%d model_rate_limit_failed model=%s error=%v", p.prefix, resp.StatusCode, modelName, err)
+		if p.accountRepo != nil && finalModelName != "" {
+			if err := p.accountRepo.SetModelRateLimit(p.ctx, p.account.ID, finalModelName, resetAt); err != nil {
+				logger.LegacyPrintf("service.antigravity_gateway", "%s status=%d model_rate_limit_failed model=%s error=%v", p.prefix, finalStatusCode, finalModelName, err)
 			} else {
 				logger.LegacyPrintf("service.antigravity_gateway", "%s status=%d model_rate_limited_after_smart_retry model=%s account=%d reset_in=%v",
-					p.prefix, resp.StatusCode, modelName, p.account.ID, rateLimitDuration)
-				s.updateAccountModelRateLimitInCache(p.ctx, p.account, modelName, resetAt)
+					p.prefix, finalStatusCode, finalModelName, p.account.ID, rateLimitDuration)
+				s.updateAccountModelRateLimitInCache(p.ctx, p.account, finalModelName, resetAt)
 			}
 		}
 
@@ -425,7 +445,7 @@ func (s *AntigravityGatewayService) handleSmartRetry(p antigravityRetryLoopParam
 			action: smartRetryActionBreakWithResp,
 			switchError: &AntigravityAccountSwitchError{
 				OriginalAccountID: p.account.ID,
-				RateLimitedModel:  modelName,
+				RateLimitedModel:  finalModelName,
 				IsStickySession:   p.isStickySession,
 			},
 		}

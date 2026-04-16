@@ -1838,9 +1838,14 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 			if platform == PlatformAntigravity {
 				candidates = s.filterByMinAntigravityRuntimePenalty(candidates)
 			}
-			// 4. 取负载率最低的集合
+			// 4. Antigravity 在同运行态层里优先复用已有成功记录的 warm 账号，
+			// 冷号只在没有 warm 候选时再参与竞争，避免前排假活跃号拖慢命中。
+			if platform == PlatformAntigravity {
+				candidates = preferWarmAntigravityAccountLoads(candidates)
+			}
+			// 5. 取负载率最低的集合
 			candidates = filterByMinLoadRate(candidates)
-			// 5. LRU 选择最久未用的账号
+			// 6. LRU 选择最久未用的账号
 			selected := selectByLRU(candidates, preferOAuth)
 			if selected == nil {
 				break
@@ -2307,6 +2312,56 @@ func (s *GatewayService) preferDirectAntigravityAccounts(ctx context.Context, ac
 	return filtered
 }
 
+func preferWarmAntigravityAccountLoads(accounts []accountWithLoad) []accountWithLoad {
+	if len(accounts) == 0 {
+		return accounts
+	}
+	hasWarm := false
+	hasCold := false
+	for _, item := range accounts {
+		if item.account == nil || item.account.Platform != PlatformAntigravity {
+			continue
+		}
+		if item.account.LastUsedAt != nil {
+			hasWarm = true
+		} else {
+			hasCold = true
+		}
+	}
+	if !hasWarm || !hasCold {
+		return accounts
+	}
+	filtered := make([]accountWithLoad, 0, len(accounts))
+	for _, item := range accounts {
+		if item.account == nil || item.account.Platform != PlatformAntigravity || item.account.LastUsedAt != nil {
+			filtered = append(filtered, item)
+		}
+	}
+	if len(filtered) == 0 {
+		return accounts
+	}
+	return filtered
+}
+
+func antigravityWarmLastUsedBetter(left, right *Account) (bool, bool) {
+	if left == nil || right == nil || left.Platform != PlatformAntigravity || right.Platform != PlatformAntigravity {
+		return false, false
+	}
+	switch {
+	case left.LastUsedAt != nil && right.LastUsedAt == nil:
+		return true, true
+	case left.LastUsedAt == nil && right.LastUsedAt != nil:
+		return false, true
+	case left.LastUsedAt == nil && right.LastUsedAt == nil:
+		return false, false
+	default:
+		if left.LastUsedAt.Equal(*right.LastUsedAt) {
+			return false, false
+		}
+		return left.LastUsedAt.Before(*right.LastUsedAt), true
+	}
+}
+
 // isAccountInGroup checks if the account belongs to the specified group.
 // When groupID is nil, returns true only for ungrouped accounts (no group assignments).
 func (s *GatewayService) isAccountInGroup(account *Account, groupID *int64) bool {
@@ -2441,6 +2496,9 @@ func (s *GatewayService) isBetterLegacyCandidate(ctx context.Context, requestedM
 	if better, decided := s.antigravityRuntimeBetter(candidate, selected); decided {
 		return better
 	}
+	if better, decided := antigravityWarmLastUsedBetter(candidate, selected); decided {
+		return better
+	}
 	switch {
 	case candidate.LastUsedAt == nil && selected.LastUsedAt != nil:
 		return true
@@ -2467,6 +2525,9 @@ func (s *GatewayService) lessAntigravityLoadCandidate(ctx context.Context, reque
 		return better
 	}
 	if better, decided := s.antigravityRuntimeBetter(left.account, right.account); decided {
+		return better
+	}
+	if better, decided := antigravityWarmLastUsedBetter(left.account, right.account); decided {
 		return better
 	}
 	if left.loadInfo.LoadRate != right.loadInfo.LoadRate {

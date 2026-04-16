@@ -122,6 +122,7 @@ func TestGatewayService_SelectAccountForModelWithExclusions_AntigravityAttemptTo
 		Status:      StatusActive,
 		Schedulable: true,
 		Priority:    1,
+		LastUsedAt:  ptr(now.Add(-2 * time.Hour)),
 	}
 	second := &Account{
 		ID:          2,
@@ -129,7 +130,7 @@ func TestGatewayService_SelectAccountForModelWithExclusions_AntigravityAttemptTo
 		Status:      StatusActive,
 		Schedulable: true,
 		Priority:    1,
-		LastUsedAt:  ptr(now.Add(-2 * time.Hour)),
+		LastUsedAt:  ptr(now.Add(-1 * time.Hour)),
 	}
 	cache := &antigravitySelectionTouchCache{
 		snapshot: []*Account{first, second},
@@ -150,7 +151,7 @@ func TestGatewayService_SelectAccountForModelWithExclusions_AntigravityAttemptTo
 	selectedFirst, err := svc.SelectAccountForModelWithExclusions(ctx, nil, "", "claude-sonnet-4-5", nil)
 	require.NoError(t, err)
 	require.NotNil(t, selectedFirst)
-	require.Equal(t, int64(1), selectedFirst.ID, "nil last_used should still win before the attempt is touched")
+	require.Equal(t, int64(1), selectedFirst.ID, "older warm account should win before the attempt is touched")
 
 	svc.MarkAntigravitySelectionAttempt(ctx, selectedFirst)
 
@@ -158,6 +159,43 @@ func TestGatewayService_SelectAccountForModelWithExclusions_AntigravityAttemptTo
 	require.NoError(t, err)
 	require.NotNil(t, selectedSecond)
 	require.Equal(t, int64(2), selectedSecond.ID, "after touching the first attempt, the older healthy candidate should be preferred next")
+}
+
+func TestGatewayService_SelectAccountForModelWithExclusions_AntigravityWarmCandidateBeatsNeverUsedColdCandidate(t *testing.T) {
+	now := time.Now()
+	cold := &Account{
+		ID:          11,
+		Platform:    PlatformAntigravity,
+		Status:      StatusActive,
+		Schedulable: true,
+		Priority:    1,
+	}
+	warm := &Account{
+		ID:          12,
+		Platform:    PlatformAntigravity,
+		Status:      StatusActive,
+		Schedulable: true,
+		Priority:    1,
+		LastUsedAt:  ptr(now.Add(-90 * time.Minute)),
+	}
+	cache := &antigravitySelectionTouchCache{
+		snapshot: []*Account{cold, warm},
+		accounts: map[int64]*Account{
+			cold.ID: cold,
+			warm.ID: warm,
+		},
+	}
+	svc := &GatewayService{
+		schedulerSnapshot: NewSchedulerSnapshotService(cache, nil, nil, nil, nil),
+		cache:             &mockGatewayCacheForPlatform{},
+		cfg:               testConfig(),
+	}
+	ctx := context.WithValue(context.Background(), ctxkey.ForcePlatform, PlatformAntigravity)
+
+	selected, err := svc.SelectAccountForModelWithExclusions(ctx, nil, "", "claude-sonnet-4-5", nil)
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+	require.Equal(t, warm.ID, selected.ID, "warm antigravity account should beat never-used cold candidate")
 }
 
 func TestGatewayService_SelectAccountWithLoadAwareness_AntigravityFailurePenaltyBeatsLowerLoad(t *testing.T) {
@@ -205,6 +243,52 @@ func TestGatewayService_SelectAccountWithLoadAwareness_AntigravityFailurePenalty
 	require.NotNil(t, result)
 	require.NotNil(t, result.Account)
 	require.Equal(t, good.ID, result.Account.ID, "recently failed antigravity account should lose priority even when its load is lower")
+}
+
+func TestGatewayService_SelectAccountWithLoadAwareness_AntigravityWarmCandidateBeatsColdLowerLoad(t *testing.T) {
+	now := time.Now()
+	cold := &Account{
+		ID:          23,
+		Platform:    PlatformAntigravity,
+		Status:      StatusActive,
+		Schedulable: true,
+		Priority:    1,
+	}
+	warm := &Account{
+		ID:          24,
+		Platform:    PlatformAntigravity,
+		Status:      StatusActive,
+		Schedulable: true,
+		Priority:    1,
+		LastUsedAt:  ptr(now.Add(-30 * time.Minute)),
+	}
+	cache := &antigravitySelectionTouchCache{
+		snapshot: []*Account{cold, warm},
+		accounts: map[int64]*Account{
+			cold.ID: cold,
+			warm.ID: warm,
+		},
+	}
+	schedulerSnapshot := NewSchedulerSnapshotService(cache, nil, nil, nil, nil)
+	concurrencyCache := stubConcurrencyCache{
+		loadMap: map[int64]*AccountLoadInfo{
+			cold.ID: {AccountID: cold.ID, LoadRate: 0},
+			warm.ID: {AccountID: warm.ID, LoadRate: 10},
+		},
+		skipDefaultLoad: true,
+	}
+	svc := &GatewayService{
+		schedulerSnapshot:  schedulerSnapshot,
+		concurrencyService: NewConcurrencyService(concurrencyCache),
+		cache:              &mockGatewayCacheForPlatform{},
+	}
+	ctx := context.WithValue(context.Background(), ctxkey.ForcePlatform, PlatformAntigravity)
+
+	result, err := svc.SelectAccountWithLoadAwareness(ctx, nil, "", "claude-sonnet-4-5", nil, "", 0)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotNil(t, result.Account)
+	require.Equal(t, warm.ID, result.Account.ID, "warm antigravity account should beat a colder lower-load candidate")
 }
 
 func TestGatewayService_SelectAccountWithLoadAwareness_AntigravityDirectCandidateBeatsCreditsFallback(t *testing.T) {
