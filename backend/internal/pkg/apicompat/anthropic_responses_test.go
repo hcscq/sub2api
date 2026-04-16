@@ -150,6 +150,42 @@ func TestAnthropicToResponses_MaxTokensFloor(t *testing.T) {
 	assert.Equal(t, 128, *resp.MaxOutputTokens)
 }
 
+func TestResponsesToAnthropicRequest_Opus47UsesAdaptiveThinking(t *testing.T) {
+	req := &ResponsesRequest{
+		Model: "claude-opus-4-7",
+		Input: json.RawMessage(`[{"role":"user","content":"hello"}]`),
+		Reasoning: &ResponsesReasoning{
+			Effort: "high",
+		},
+	}
+
+	out, err := ResponsesToAnthropicRequest(req)
+	require.NoError(t, err)
+	require.NotNil(t, out.Thinking)
+	require.Equal(t, "adaptive", out.Thinking.Type)
+	require.Zero(t, out.Thinking.BudgetTokens)
+	require.NotNil(t, out.OutputConfig)
+	require.Equal(t, "high", out.OutputConfig.Effort)
+}
+
+func TestResponsesToAnthropicRequest_Opus46KeepsBudgetThinking(t *testing.T) {
+	req := &ResponsesRequest{
+		Model: "claude-opus-4-6",
+		Input: json.RawMessage(`[{"role":"user","content":"hello"}]`),
+		Reasoning: &ResponsesReasoning{
+			Effort: "high",
+		},
+	}
+
+	out, err := ResponsesToAnthropicRequest(req)
+	require.NoError(t, err)
+	require.NotNil(t, out.Thinking)
+	require.Equal(t, "enabled", out.Thinking.Type)
+	require.Equal(t, 10240, out.Thinking.BudgetTokens)
+	require.NotNil(t, out.OutputConfig)
+	require.Equal(t, "high", out.OutputConfig.Effort)
+}
+
 // ---------------------------------------------------------------------------
 // ResponsesToAnthropic (non-streaming) tests
 // ---------------------------------------------------------------------------

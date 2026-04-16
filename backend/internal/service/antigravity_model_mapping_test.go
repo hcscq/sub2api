@@ -39,6 +39,12 @@ func TestAntigravityGatewayService_GetMappedModel(t *testing.T) {
 
 		// 2. 默认映射（DefaultAntigravityModelMapping）
 		{
+			name:           "默认映射 - claude-opus-4-7 → claude-opus-4-7",
+			requestedModel: "claude-opus-4-7",
+			accountMapping: nil,
+			expected:       "claude-opus-4-7",
+		},
+		{
 			name:           "默认映射 - claude-opus-4-6 → claude-opus-4-6-thinking",
 			requestedModel: "claude-opus-4-6",
 			accountMapping: nil,
@@ -87,6 +93,12 @@ func TestAntigravityGatewayService_GetMappedModel(t *testing.T) {
 			requestedModel: "claude-sonnet-4-5",
 			accountMapping: nil,
 			expected:       "claude-sonnet-4-5",
+		},
+		{
+			name:           "默认映射透传 - claude-opus-4-7",
+			requestedModel: "claude-opus-4-7",
+			accountMapping: nil,
+			expected:       "claude-opus-4-7",
 		},
 		{
 			name:           "默认映射透传 - claude-opus-4-6-thinking",

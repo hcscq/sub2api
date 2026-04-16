@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 )
 
 // ResponsesToAnthropicRequest converts a Responses API request into an
@@ -57,9 +59,11 @@ func ResponsesToAnthropicRequest(req *ResponsesRequest) (*AnthropicRequest, erro
 		out.OutputConfig = &AnthropicOutputConfig{Effort: effort}
 		// Enable thinking for non-low efforts
 		if effort != "low" {
-			out.Thinking = &AnthropicThinking{
-				Type:         "enabled",
-				BudgetTokens: defaultThinkingBudget(effort),
+			out.Thinking = &AnthropicThinking{Type: "enabled"}
+			if claude.IsOpus47OrNewer(req.Model) {
+				out.Thinking.Type = "adaptive"
+			} else {
+				out.Thinking.BudgetTokens = defaultThinkingBudget(effort)
 			}
 		}
 	}

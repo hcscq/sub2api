@@ -188,6 +188,8 @@ func PrepareBedrockRequestBody(body []byte, modelID string, betaHeader string) (
 func PrepareBedrockRequestBodyWithTokens(body []byte, modelID string, betaTokens []string) ([]byte, error) {
 	var err error
 
+	body, _ = normalizeAnthropicOpus47RequestBody(body, modelID)
+
 	// 注入 anthropic_version（Bedrock 要求）
 	body, err = sjson.SetBytes(body, "anthropic_version", "bedrock-2023-05-31")
 	if err != nil {

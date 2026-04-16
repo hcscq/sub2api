@@ -49,6 +49,21 @@ func TestNormalizeClaudeOAuthRequestBody_PreservesTopLevelFieldOrder(t *testing.
 	require.Contains(t, resultStr, `"metadata":{"user_id":"user-1"}`)
 }
 
+func TestNormalizeClaudeOAuthRequestBody_Opus47NormalizationPreservesFieldOrder(t *testing.T) {
+	body := []byte(`{"alpha":1,"model":"claude-opus-4-7","messages":[],"thinking":{"type":"enabled","budget_tokens":2048},"temperature":0.2,"top_p":0.9,"top_k":16,"omega":2}`)
+
+	result, modelID := normalizeClaudeOAuthRequestBody(body, "claude-opus-4-7", claudeOAuthNormalizeOptions{})
+	resultStr := string(result)
+
+	require.Equal(t, "claude-opus-4-7", modelID)
+	assertJSONTokenOrder(t, resultStr, `"alpha"`, `"model"`, `"messages"`, `"thinking"`, `"omega"`, `"tools"`)
+	require.Contains(t, resultStr, `"thinking":{"type":"adaptive"}`)
+	require.NotContains(t, resultStr, `"budget_tokens"`)
+	require.NotContains(t, resultStr, `"temperature"`)
+	require.NotContains(t, resultStr, `"top_p"`)
+	require.NotContains(t, resultStr, `"top_k"`)
+}
+
 func TestInjectClaudeCodePrompt_PreservesFieldOrder(t *testing.T) {
 	body := []byte(`{"alpha":1,"system":[{"id":"block-1","type":"text","text":"Custom"}],"messages":[],"omega":2}`)
 

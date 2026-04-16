@@ -1197,6 +1197,10 @@ func normalizeClaudeOAuthRequestBody(body []byte, modelID string, opts claudeOAu
 			modified = true
 		}
 	}
+	if next, changed := normalizeAnthropicOpus47RequestBody(out, modelID); changed {
+		out = next
+		modified = true
+	}
 
 	if !modified {
 		return body, modelID
@@ -4590,6 +4594,11 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 		reqModel = mappedModel
 		logger.LegacyPrintf("service.gateway", "Model mapping applied: %s -> %s (account: %s, source=%s)", originalModel, mappedModel, account.Name, mappingSource)
 	}
+	if account.Platform == PlatformAnthropic && account.Type != AccountTypeBedrock {
+		if next, changed := normalizeAnthropicOpus47RequestBody(body, reqModel); changed {
+			body = next
+		}
+	}
 
 	// 获取凭证
 	token, tokenType, err := s.GetAccessToken(ctx, account)
@@ -5106,6 +5115,9 @@ func (s *GatewayService) forwardAnthropicAPIKeyPassthroughWithInput(
 	}
 	// Pre-filter: strip empty text blocks (including nested in tool_result) to prevent upstream 400.
 	input.Body = StripEmptyTextBlocks(input.Body)
+	if next, changed := normalizeAnthropicOpus47RequestBody(input.Body, input.RequestModel); changed {
+		input.Body = next
+	}
 
 	// 重试间复用同一请求体，避免每次 string(body) 产生额外分配。
 	setOpsUpstreamRequestBody(c, input.Body)
@@ -8805,6 +8817,11 @@ func (s *GatewayService) ForwardCountTokens(ctx context.Context, c *gin.Context,
 			logger.LegacyPrintf("service.gateway", "CountTokens model mapping applied: %s -> %s (account: %s, source=%s)", parsed.Model, mappedModel, account.Name, mappingSource)
 		}
 	}
+	if account.Platform == PlatformAnthropic && account.Type != AccountTypeBedrock {
+		if next, changed := normalizeAnthropicOpus47RequestBody(body, reqModel); changed {
+			body = next
+		}
+	}
 
 	// 获取凭证
 	token, tokenType, err := s.GetAccessToken(ctx, account)
@@ -8925,6 +8942,10 @@ func (s *GatewayService) ForwardCountTokens(ctx context.Context, c *gin.Context,
 }
 
 func (s *GatewayService) forwardCountTokensAnthropicAPIKeyPassthrough(ctx context.Context, c *gin.Context, account *Account, body []byte) error {
+	if next, changed := normalizeAnthropicOpus47RequestBody(body, ""); changed {
+		body = next
+	}
+
 	token, tokenType, err := s.GetAccessToken(ctx, account)
 	if err != nil {
 		s.countTokensError(c, http.StatusBadGateway, "upstream_error", "Failed to get access token")

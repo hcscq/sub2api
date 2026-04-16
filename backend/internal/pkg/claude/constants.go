@@ -72,6 +72,12 @@ type Model struct {
 // DefaultModels Claude Code 客户端支持的默认模型列表
 var DefaultModels = []Model{
 	{
+		ID:          "claude-opus-4-7",
+		Type:        "model",
+		DisplayName: "Claude Opus 4.7",
+		CreatedAt:   "2026-04-16T00:00:00Z",
+	},
+	{
 		ID:          "claude-opus-4-5-20251101",
 		Type:        "model",
 		DisplayName: "Claude Opus 4.5",

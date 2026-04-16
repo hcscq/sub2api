@@ -73,6 +73,18 @@ func TestPrepareBedrockRequestBody_RemoveOutputConfig(t *testing.T) {
 	assert.False(t, gjson.GetBytes(result, "output_config").Exists())
 }
 
+func TestPrepareBedrockRequestBody_Opus47Normalization(t *testing.T) {
+	input := `{"model":"claude-opus-4-7","max_tokens":1024,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":4096},"temperature":0.2,"top_p":0.8,"top_k":12}`
+	result, err := PrepareBedrockRequestBody([]byte(input), "us.anthropic.claude-opus-4-7-v1", "")
+	require.NoError(t, err)
+
+	assert.Equal(t, "adaptive", gjson.GetBytes(result, "thinking.type").String())
+	assert.False(t, gjson.GetBytes(result, "thinking.budget_tokens").Exists())
+	assert.False(t, gjson.GetBytes(result, "temperature").Exists())
+	assert.False(t, gjson.GetBytes(result, "top_p").Exists())
+	assert.False(t, gjson.GetBytes(result, "top_k").Exists())
+}
+
 func TestRemoveCustomFieldFromTools(t *testing.T) {
 	input := `{
 		"tools": [
@@ -449,6 +461,20 @@ func TestResolveBedrockModelID(t *testing.T) {
 		modelID, ok := ResolveBedrockModelID(account, "claude-opus-4-6-thinking")
 		require.True(t, ok)
 		assert.Equal(t, "au.anthropic.claude-opus-4-6-v1", modelID)
+	})
+
+	t.Run("default alias resolves opus 4.7", func(t *testing.T) {
+		account := &Account{
+			Platform: PlatformAnthropic,
+			Type:     AccountTypeBedrock,
+			Credentials: map[string]any{
+				"aws_region": "us-east-1",
+			},
+		}
+
+		modelID, ok := ResolveBedrockModelID(account, "claude-opus-4-7")
+		require.True(t, ok)
+		assert.Equal(t, "us.anthropic.claude-opus-4-7-v1", modelID)
 	})
 
 	t.Run("force global rewrites anthropic regional model id", func(t *testing.T) {

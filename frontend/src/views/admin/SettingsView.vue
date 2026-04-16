@@ -3922,14 +3922,14 @@ const betaPresets: Record<string, Array<{
       label: t('admin.settings.betaPolicy.presetOpusOnly'),
       description: t('admin.settings.betaPolicy.presetOpusOnlyDesc'),
       action: 'pass',
-      model_whitelist: ['claude-opus-4-6'],
+      model_whitelist: ['claude-opus-4-7', 'claude-opus-4-6'],
       fallback_action: 'filter',
     },
   ],
 }
 
 // 常用模型模式（具体 ID + 通配符示例）
-const commonModelPatterns = ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-opus-*', 'claude-sonnet-*']
+const commonModelPatterns = ['claude-opus-4-7', 'claude-opus-4-6', 'claude-sonnet-4-6', 'claude-opus-*', 'claude-sonnet-*']
 
 function getBetaDisplayName(token: string): string {
   return betaDisplayNames[token] || token
