@@ -123,6 +123,7 @@ services:
       # SECURITY: This repo does not embed third-party client_secret.
       - GEMINI_CLI_OAUTH_CLIENT_SECRET=${GEMINI_CLI_OAUTH_CLIENT_SECRET:-}
       - ANTIGRAVITY_OAUTH_CLIENT_SECRET=${ANTIGRAVITY_OAUTH_CLIENT_SECRET:-}
+      - GATEWAY_ANTIGRAVITY_FORWARD_BASE_URL=${GATEWAY_ANTIGRAVITY_FORWARD_BASE_URL:-}
 
       # =======================================================================
       # Security Configuration (URL Allowlist)
