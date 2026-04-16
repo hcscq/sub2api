@@ -197,14 +197,22 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 				h.responsesErrorResponse(c, http.StatusServiceUnavailable, "api_error", "No available accounts")
 				return
 			}
-			accountReleaseFunc, err = h.concurrencyHelper.AcquireAccountSlotWithWaitTimeout(
+			queueFull := false
+			accountReleaseFunc, queueFull, err = h.acquireWaitPlannedAccountSlot(
 				c,
-				account.ID,
-				selection.WaitPlan.MaxConcurrency,
-				selection.WaitPlan.Timeout,
+				apiKey.GroupID,
+				sessionHash,
+				account,
+				selection.WaitPlan,
 				reqStream,
 				&streamStarted,
+				reqLog,
+				"gateway.responses",
 			)
+			if queueFull {
+				h.responsesErrorResponse(c, http.StatusTooManyRequests, "rate_limit_error", "Too many pending requests, please retry later")
+				return
+			}
 			if err != nil {
 				reqLog.Warn("gateway.responses.account_slot_acquire_failed", zap.Int64("account_id", account.ID), zap.Error(err))
 				h.handleConcurrencyError(c, err, "account", streamStarted)
