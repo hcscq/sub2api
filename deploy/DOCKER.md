@@ -61,7 +61,6 @@ volumes:
 ## Supported Architectures
 
 - `linux/amd64`
-- `linux/arm64`
 
 ## Tags
 
