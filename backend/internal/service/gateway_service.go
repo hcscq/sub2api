@@ -1563,22 +1563,24 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 							}
 
 							if stickyCacheMissReason == "" {
-								waitingCount, _ := s.concurrencyService.GetAccountWaitingCount(ctx, stickyAccountID)
-								if waitingCount < cfg.StickySessionMaxWaiting {
-									// 会话数量限制检查（等待计划也需要占用会话配额）
-									if !s.checkAndRegisterSession(ctx, stickyAccount, sessionHash) {
-										stickyCacheMissReason = "session_limit"
-										// 会话限制已满，继续到负载感知选择
-									} else {
-										return &AccountSelectionResult{
-											Account: stickyAccount,
-											WaitPlan: &AccountWaitPlan{
-												AccountID:      stickyAccountID,
-												MaxConcurrency: stickyAccount.Concurrency,
-												Timeout:        cfg.StickySessionWaitTimeout,
-												MaxWaiting:     cfg.StickySessionMaxWaiting,
-											},
-										}, nil
+								if !s.shouldAntigravityFallThroughRoutedStickyWait(platform, routingCandidates, stickyAccountID) {
+									waitingCount, _ := s.concurrencyService.GetAccountWaitingCount(ctx, stickyAccountID)
+									if waitingCount < cfg.StickySessionMaxWaiting {
+										// 会话数量限制检查（等待计划也需要占用会话配额）
+										if !s.checkAndRegisterSession(ctx, stickyAccount, sessionHash) {
+											stickyCacheMissReason = "session_limit"
+											// 会话限制已满，继续到负载感知选择
+										} else {
+											return &AccountSelectionResult{
+												Account: stickyAccount,
+												WaitPlan: &AccountWaitPlan{
+													AccountID:      stickyAccountID,
+													MaxConcurrency: stickyAccount.Concurrency,
+													Timeout:        cfg.StickySessionWaitTimeout,
+													MaxWaiting:     cfg.StickySessionMaxWaiting,
+												},
+											}, nil
+										}
 									}
 								} else {
 									stickyCacheMissReason = "wait_queue_full"
@@ -1737,18 +1739,20 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 						}
 					}
 
-					waitingCount, _ := s.concurrencyService.GetAccountWaitingCount(ctx, accountID)
-					if waitingCount < cfg.StickySessionMaxWaiting {
-						// 会话数量限制检查（等待计划也需要占用会话配额）
-						if !s.checkAndRegisterSession(ctx, account, sessionHash) {
-							// 会话限制已满，继续到 Layer 2
-						} else {
-							return s.newSelectionResult(ctx, account, false, nil, &AccountWaitPlan{
-								AccountID:      accountID,
-								MaxConcurrency: account.Concurrency,
-								Timeout:        cfg.StickySessionWaitTimeout,
-								MaxWaiting:     cfg.StickySessionMaxWaiting,
-							})
+					if !s.shouldAntigravityFallThroughStickyWait(ctx, accounts, accountID, requestedModel, excludedIDs, platform, useMixed) {
+						waitingCount, _ := s.concurrencyService.GetAccountWaitingCount(ctx, accountID)
+						if waitingCount < cfg.StickySessionMaxWaiting {
+							// 会话数量限制检查（等待计划也需要占用会话配额）
+							if !s.checkAndRegisterSession(ctx, account, sessionHash) {
+								// 会话限制已满，继续到 Layer 2
+							} else {
+								return s.newSelectionResult(ctx, account, false, nil, &AccountWaitPlan{
+									AccountID:      accountID,
+									MaxConcurrency: account.Concurrency,
+									Timeout:        cfg.StickySessionWaitTimeout,
+									MaxWaiting:     cfg.StickySessionMaxWaiting,
+								})
+							}
 						}
 					}
 				}
@@ -2589,6 +2593,67 @@ func hasImmediateConcurrencyCapacity(loadInfo *AccountLoadInfo, maxConcurrency i
 		return true
 	}
 	return loadInfo.CurrentConcurrency < maxConcurrency
+}
+
+func (s *GatewayService) shouldAntigravityFallThroughStickyWait(
+	ctx context.Context,
+	accounts []Account,
+	stickyAccountID int64,
+	requestedModel string,
+	excludedIDs map[int64]struct{},
+	platform string,
+	useMixed bool,
+) bool {
+	if platform != PlatformAntigravity {
+		return false
+	}
+	for i := range accounts {
+		account := &accounts[i]
+		if account == nil || account.ID == stickyAccountID {
+			continue
+		}
+		if excludedIDs != nil {
+			if _, excluded := excludedIDs[account.ID]; excluded {
+				continue
+			}
+		}
+		if !s.isAccountSchedulableForSelection(account) {
+			continue
+		}
+		if !s.isAccountAllowedForPlatform(account, platform, useMixed) {
+			continue
+		}
+		if requestedModel != "" && !s.isModelSupportedByAccountWithContext(ctx, account, requestedModel) {
+			continue
+		}
+		if !s.isAccountSchedulableForModelSelection(ctx, account, requestedModel) {
+			continue
+		}
+		if !s.isAccountSchedulableForQuota(account) {
+			continue
+		}
+		if !s.isAccountSchedulableForWindowCost(ctx, account, false) {
+			continue
+		}
+		if !s.isAccountSchedulableForRPM(ctx, account, false) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func (s *GatewayService) shouldAntigravityFallThroughRoutedStickyWait(platform string, routingCandidates []*Account, stickyAccountID int64) bool {
+	if platform != PlatformAntigravity {
+		return false
+	}
+	for _, account := range routingCandidates {
+		if account == nil || account.ID == stickyAccountID {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func (s *GatewayService) lessWaitCandidate(ctx context.Context, requestedModel string, preferOAuth bool, left, right accountWithLoad) bool {

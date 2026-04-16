@@ -48,7 +48,7 @@ func TestHandleSmartRetry_503_ModelCapacityExhausted_UsesShortRetryBudget(t *tes
 	}
 
 	params := antigravityRetryLoopParams{
-		ctx:          context.Background(),
+		ctx:          ctxWithSingleAccountRetry(),
 		prefix:       "[test]",
 		account:      account,
 		accessToken:  "token",

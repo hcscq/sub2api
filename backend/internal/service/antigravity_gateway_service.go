@@ -261,6 +261,46 @@ func (s *AntigravityGatewayService) handleSmartRetry(p antigravityRetryLoopParam
 
 	// 情况2: retryDelay < 阈值（或 MODEL_CAPACITY_EXHAUSTED），智能重试
 	if shouldSmartRetry {
+		if shouldPreferAntigravityFastFailover(p.ctx, isModelCapacityExhausted) {
+			if isModelCapacityExhausted {
+				logger.LegacyPrintf("service.antigravity_gateway", "%s status=%d model_capacity_fast_failover model=%s account=%d body=%s (skip in-service retry, defer to handler backoff)",
+					p.prefix, resp.StatusCode, modelName, p.account.ID, truncateForLog(respBody, 200))
+				return &smartRetryResult{
+					action: smartRetryActionBreakWithResp,
+					resp: &http.Response{
+						StatusCode: resp.StatusCode,
+						Header:     resp.Header.Clone(),
+						Body:       io.NopCloser(bytes.NewReader(respBody)),
+					},
+				}
+			}
+
+			rateLimitDuration := waitDuration
+			if rateLimitDuration <= 0 {
+				rateLimitDuration = antigravityDefaultRateLimitDuration
+			}
+			switchCount, _ := AccountSwitchCountFromContext(p.ctx)
+			logger.LegacyPrintf("service.antigravity_gateway", "%s status=%d smart_retry_fast_failover model=%s account=%d switch_count=%d upstream_retry_delay=%v body=%s (skip in-service wait, switch account)",
+				p.prefix, resp.StatusCode, modelName, p.account.ID, switchCount, rateLimitDuration, truncateForLog(respBody, 200))
+
+			resetAt := time.Now().Add(rateLimitDuration)
+			if setModelRateLimitByModelName(p.ctx, p.accountRepo, p.account.ID, modelName, p.prefix, resp.StatusCode, resetAt, false) {
+				s.updateAccountModelRateLimitInCache(p.ctx, p.account, modelName, resetAt)
+			}
+			if s.cache != nil && p.sessionHash != "" {
+				_ = s.cache.DeleteSessionAccountID(p.ctx, p.groupID, p.sessionHash)
+			}
+
+			return &smartRetryResult{
+				action: smartRetryActionBreakWithResp,
+				switchError: &AntigravityAccountSwitchError{
+					OriginalAccountID: p.account.ID,
+					RateLimitedModel:  modelName,
+					IsStickySession:   p.isStickySession,
+				},
+			}
+		}
+
 		var lastRetryResp *http.Response
 		var lastRetryBody []byte
 
@@ -453,6 +493,17 @@ func (s *AntigravityGatewayService) handleSmartRetry(p antigravityRetryLoopParam
 
 	// 未触发智能重试，继续默认重试逻辑
 	return &smartRetryResult{action: smartRetryActionContinue}
+}
+
+func shouldPreferAntigravityFastFailover(ctx context.Context, isModelCapacityExhausted bool) bool {
+	if isSingleAccountRetry(ctx) {
+		return false
+	}
+	if isModelCapacityExhausted {
+		return true
+	}
+	switchCount, ok := AccountSwitchCountFromContext(ctx)
+	return ok && switchCount > 0
 }
 
 // handleSingleAccountRetryInPlace 单账号 503 退避重试的原地重试逻辑。

@@ -159,7 +159,7 @@ func TestHandleSmartRetry_LongDelay_ReturnsSwitchError(t *testing.T) {
 	}
 
 	params := antigravityRetryLoopParams{
-		ctx:             context.Background(),
+		ctx:             ctxWithSingleAccountRetry(),
 		prefix:          "[test]",
 		account:         account,
 		accessToken:     "token",
@@ -300,7 +300,7 @@ func TestHandleSmartRetry_ShortDelay_SmartRetryFailed_ReturnsSwitchError(t *test
 	}
 
 	params := antigravityRetryLoopParams{
-		ctx:             context.Background(),
+		ctx:             ctxWithSingleAccountRetry(),
 		prefix:          "[test]",
 		account:         account,
 		accessToken:     "token",
@@ -332,6 +332,150 @@ func TestHandleSmartRetry_ShortDelay_SmartRetryFailed_ReturnsSwitchError(t *test
 	require.Len(t, repo.modelRateLimitCalls, 1)
 	require.Equal(t, "gemini-3-flash", repo.modelRateLimitCalls[0].modelKey)
 	require.Len(t, upstream.calls, 1, "should have made one retry call (max attempts)")
+}
+
+func TestHandleSmartRetry_503_ModelCapacityExhausted_MultiAccountFastFailover(t *testing.T) {
+	resetModelCapacityExhaustedStateForTest(t)
+
+	upstream := &mockSmartRetryUpstream{
+		responses: []*http.Response{
+			{
+				StatusCode: http.StatusServiceUnavailable,
+				Header:     http.Header{},
+				Body: io.NopCloser(strings.NewReader(`{
+					"error": {
+						"code": 503,
+						"status": "UNAVAILABLE",
+						"details": [
+							{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "metadata": {"model": "gemini-3-pro"}, "reason": "MODEL_CAPACITY_EXHAUSTED"},
+							{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "12s"}
+						]
+					}
+				}`)),
+			},
+		},
+		errors: []error{nil},
+	}
+
+	account := &Account{
+		ID:       81,
+		Name:     "acc-fast-failover",
+		Type:     AccountTypeOAuth,
+		Platform: PlatformAntigravity,
+	}
+
+	respBody := []byte(`{
+		"error": {
+			"code": 503,
+			"status": "UNAVAILABLE",
+			"details": [
+				{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "metadata": {"model": "gemini-3-pro"}, "reason": "MODEL_CAPACITY_EXHAUSTED"},
+				{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "12s"}
+			]
+		}
+	}`)
+	resp := &http.Response{
+		StatusCode: http.StatusServiceUnavailable,
+		Header:     http.Header{},
+		Body:       io.NopCloser(bytes.NewReader(respBody)),
+	}
+
+	params := antigravityRetryLoopParams{
+		ctx:          context.Background(),
+		prefix:       "[test]",
+		account:      account,
+		accessToken:  "token",
+		action:       "generateContent",
+		body:         []byte(`{"input":"test"}`),
+		httpUpstream: upstream,
+		handleError: func(ctx context.Context, prefix string, account *Account, statusCode int, headers http.Header, body []byte, requestedModel string, groupID int64, sessionHash string, isStickySession bool) *handleModelRateLimitResult {
+			return nil
+		},
+	}
+
+	svc := &AntigravityGatewayService{}
+	result := svc.handleSmartRetry(params, resp, respBody, "https://ag-1.test", 0, []string{"https://ag-1.test"})
+
+	require.NotNil(t, result)
+	require.Equal(t, smartRetryActionBreakWithResp, result.action)
+	require.NotNil(t, result.resp, "multi-account model capacity should return response immediately to handler failover")
+	require.Nil(t, result.switchError, "MODEL_CAPACITY_EXHAUSTED should be classified by handler from response body")
+	require.Len(t, upstream.calls, 0, "should not perform in-service retries for shared model capacity errors")
+}
+
+func TestHandleSmartRetry_ShortDelay_AfterSwitch_FastFailoverWithoutWaiting(t *testing.T) {
+	repo := &stubAntigravityAccountRepo{}
+	cache := &stubSmartRetryCache{}
+	upstream := &mockSmartRetryUpstream{
+		responses: []*http.Response{
+			{
+				StatusCode: http.StatusTooManyRequests,
+				Header:     http.Header{},
+				Body: io.NopCloser(strings.NewReader(`{
+					"error": {
+						"status": "RESOURCE_EXHAUSTED",
+						"details": [
+							{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "metadata": {"model": "claude-sonnet-4-5"}, "reason": "RATE_LIMIT_EXCEEDED"},
+							{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "2s"}
+						]
+					}
+				}`)),
+			},
+		},
+		errors: []error{nil},
+	}
+
+	account := &Account{
+		ID:       82,
+		Name:     "acc-after-switch",
+		Type:     AccountTypeOAuth,
+		Platform: PlatformAntigravity,
+	}
+
+	respBody := []byte(`{
+		"error": {
+			"status": "RESOURCE_EXHAUSTED",
+			"details": [
+				{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "metadata": {"model": "claude-sonnet-4-5"}, "reason": "RATE_LIMIT_EXCEEDED"},
+				{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "2s"}
+			]
+		}
+	}`)
+	resp := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     http.Header{},
+		Body:       io.NopCloser(bytes.NewReader(respBody)),
+	}
+
+	ctx := WithAccountSwitchCount(context.Background(), 1, false)
+	params := antigravityRetryLoopParams{
+		ctx:             ctx,
+		prefix:          "[test]",
+		account:         account,
+		accessToken:     "token",
+		action:          "generateContent",
+		body:            []byte(`{"input":"test"}`),
+		httpUpstream:    upstream,
+		accountRepo:     repo,
+		sessionHash:     "sticky-session",
+		groupID:         9,
+		isStickySession: true,
+		handleError: func(ctx context.Context, prefix string, account *Account, statusCode int, headers http.Header, body []byte, requestedModel string, groupID int64, sessionHash string, isStickySession bool) *handleModelRateLimitResult {
+			return nil
+		},
+	}
+
+	svc := &AntigravityGatewayService{cache: cache}
+	result := svc.handleSmartRetry(params, resp, respBody, "https://ag-1.test", 0, []string{"https://ag-1.test"})
+
+	require.NotNil(t, result)
+	require.Equal(t, smartRetryActionBreakWithResp, result.action)
+	require.Nil(t, result.resp)
+	require.NotNil(t, result.switchError, "after one account switch, short-delay rate limit should switch immediately")
+	require.Equal(t, "claude-sonnet-4-5", result.switchError.RateLimitedModel)
+	require.Len(t, repo.modelRateLimitCalls, 1, "fast failover should mark the account model-limited without sleeping")
+	require.Len(t, cache.deleteCalls, 1, "fast failover should clear sticky session so the next selection can move away")
+	require.Len(t, upstream.calls, 0, "fast failover should not perform in-service retry calls after account switching already started")
 }
 
 // 首次响应为 429 短延迟时会进入智能重试；若最后一次重试结果漂移为
@@ -453,7 +597,7 @@ func TestHandleSmartRetry_503_ModelCapacityExhausted_RetrySuccess(t *testing.T) 
 	}
 
 	params := antigravityRetryLoopParams{
-		ctx:             context.Background(),
+		ctx:             ctxWithSingleAccountRetry(),
 		prefix:          "[test]",
 		account:         account,
 		accessToken:     "token",
@@ -517,7 +661,7 @@ func TestHandleSmartRetry_503_ModelCapacityExhausted_ContextCancel(t *testing.T)
 	cancel()
 
 	params := antigravityRetryLoopParams{
-		ctx:         ctx,
+		ctx:         WithSingleAccountRetry(ctx, true, false),
 		prefix:      "[test]",
 		account:     account,
 		accessToken: "token",
