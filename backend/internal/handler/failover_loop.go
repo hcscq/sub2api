@@ -38,7 +38,8 @@ const (
 	// Handler 层只需短暂间隔后重新进入 Service 层即可。
 	singleAccountBackoffDelay = 2 * time.Second
 	// modelCapacityBackoffDelay 多账号 MODEL_CAPACITY_EXHAUSTED 回退窗口。
-	// Antigravity 同模型容量错误可能是瞬时波动；在尝试完一轮候选后，给一次短窗口再重新选号。
+	// Antigravity 同模型容量错误属于共享容量池波动；Service 层智能重试耗尽后，
+	// Handler 层只给一次短窗口再重试整池，避免继续串行切账号放大延迟。
 	modelCapacityBackoffDelay = 2 * time.Second
 	// maxModelCapacityBackoffs 多账号 MODEL_CAPACITY_EXHAUSTED 额外回退次数上限。
 	maxModelCapacityBackoffs = 1
@@ -93,13 +94,35 @@ func (s *FailoverState) HandleFailoverError(
 	}
 
 	// Antigravity 的 MODEL_CAPACITY_EXHAUSTED 先记录下来。
-	// 多账号场景不再立刻终止：先继续尝试其他候选，并在一轮用尽后给一次短回退窗口。
+	// 多账号场景不再继续串行切账号：直接给一次共享回退窗口，再重试整池。
 	if failoverErr.ModelCapacityExhausted {
 		logger.FromContext(ctx).Warn("gateway.failover_model_capacity_exhausted",
 			zap.Int64("account_id", accountID),
 			zap.Int("upstream_status", failoverErr.StatusCode),
 			zap.Bool("single_account_backoff", s.singleAccountBackoff),
 		)
+		if !s.singleAccountBackoff {
+			if s.modelCapacityBackoffs >= maxModelCapacityBackoffs {
+				return FailoverExhausted
+			}
+
+			s.modelCapacityBackoffs++
+			logger.FromContext(ctx).Warn("gateway.failover_model_capacity_backoff",
+				zap.Int64("account_id", accountID),
+				zap.Duration("backoff_delay", modelCapacityBackoffDelay),
+				zap.Int("backoff_count", s.modelCapacityBackoffs),
+				zap.Int("backoff_max", maxModelCapacityBackoffs),
+			)
+			if !sleepWithContext(ctx, modelCapacityBackoffDelay) {
+				return FailoverCanceled
+			}
+			logger.FromContext(ctx).Warn("gateway.failover_model_capacity_retry",
+				zap.Int64("account_id", accountID),
+				zap.Int("backoff_count", s.modelCapacityBackoffs),
+			)
+			s.FailedAccountIDs = make(map[int64]struct{})
+			return FailoverContinue
+		}
 	}
 
 	// 同账号重试：对 RetryableOnSameAccount 的临时性错误，先在同一账号上重试
@@ -165,32 +188,6 @@ func (s *FailoverState) HandleFailoverError(
 // 返回 FailoverExhausted 时，调用方应返回错误响应。
 // 返回 FailoverCanceled 时，调用方应直接 return。
 func (s *FailoverState) HandleSelectionExhausted(ctx context.Context) FailoverAction {
-	if !s.singleAccountBackoff &&
-		s.LastFailoverErr != nil &&
-		s.LastFailoverErr.ModelCapacityExhausted &&
-		s.SwitchCount < s.MaxSwitches &&
-		s.modelCapacityBackoffs < maxModelCapacityBackoffs {
-
-		s.modelCapacityBackoffs++
-		logger.FromContext(ctx).Warn("gateway.failover_model_capacity_backoff",
-			zap.Duration("backoff_delay", modelCapacityBackoffDelay),
-			zap.Int("switch_count", s.SwitchCount),
-			zap.Int("max_switches", s.MaxSwitches),
-			zap.Int("backoff_count", s.modelCapacityBackoffs),
-			zap.Int("backoff_max", maxModelCapacityBackoffs),
-		)
-		if !sleepWithContext(ctx, modelCapacityBackoffDelay) {
-			return FailoverCanceled
-		}
-		logger.FromContext(ctx).Warn("gateway.failover_model_capacity_retry",
-			zap.Int("switch_count", s.SwitchCount),
-			zap.Int("max_switches", s.MaxSwitches),
-			zap.Int("backoff_count", s.modelCapacityBackoffs),
-		)
-		s.FailedAccountIDs = make(map[int64]struct{})
-		return FailoverContinue
-	}
-
 	if s.singleAccountBackoff &&
 		s.LastFailoverErr != nil &&
 		s.LastFailoverErr.StatusCode == http.StatusServiceUnavailable &&
