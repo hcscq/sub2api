@@ -1621,13 +1621,14 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 
 			// 3. 按负载感知排序
 			var routingAvailable []accountWithLoad
+			var routingWaitCandidates []accountWithLoad
 			for _, acc := range routingCandidates {
-				loadInfo := routingLoadMap[acc.ID]
-				if loadInfo == nil {
-					loadInfo = &AccountLoadInfo{AccountID: acc.ID}
-				}
-				if loadInfo.LoadRate < 100 {
-					routingAvailable = append(routingAvailable, accountWithLoad{account: acc, loadInfo: loadInfo})
+				loadInfo := loadInfoOrDefault(routingLoadMap, acc.ID)
+				item := accountWithLoad{account: acc, loadInfo: loadInfo}
+				routingWaitCandidates = append(routingWaitCandidates, item)
+				// WaitingCount 会放大 LoadRate；是否还能立即抢到真实并发槽位，必须看当前占用数。
+				if hasImmediateConcurrencyCapacity(loadInfo, acc.EffectiveLoadFactor()) {
+					routingAvailable = append(routingAvailable, item)
 				}
 			}
 
@@ -1681,9 +1682,18 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 					}
 				}
 
-				// 5. 所有路由账号槽位满，尝试返回等待计划（选择负载最低的）
-				// 遍历找到第一个满足会话限制的账号
-				for _, item := range routingAvailable {
+			}
+
+			// 5. 所有路由账号暂无可立即获取的槽位，按当前等待深度选择排队目标，
+			// 避免少账号场景下把所有请求都压到同一个账号的等待队列。
+			if len(routingWaitCandidates) > 0 {
+				if platform == PlatformAntigravity {
+					routingWaitCandidates = s.preferDirectAntigravityAccountLoads(ctx, routingWaitCandidates, requestedModel)
+				}
+				sort.SliceStable(routingWaitCandidates, func(i, j int) bool {
+					return s.lessWaitCandidate(ctx, requestedModel, preferOAuth, routingWaitCandidates[i], routingWaitCandidates[j])
+				})
+				for _, item := range routingWaitCandidates {
 					if !s.checkAndRegisterSession(ctx, item.account, sessionHash) {
 						continue // 会话限制已满，尝试下一个
 					}
@@ -1699,7 +1709,7 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 				}
 				// 所有路由账号会话限制都已满，继续到 Layer 2 回退
 			}
-			// 路由列表中的账号都不可用（负载率 >= 100），继续到 Layer 2 回退
+			// 路由列表中的账号都不可用，继续到 Layer 2 回退
 			logger.LegacyPrintf("service.gateway", "[ModelRouting] All routed accounts unavailable for model=%s, falling back to normal selection", requestedModel)
 		}
 	}
@@ -1813,16 +1823,17 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 		}
 	} else {
 		var available []accountWithLoad
+		var waitCandidates []accountWithLoad
 		for _, acc := range candidates {
-			loadInfo := loadMap[acc.ID]
-			if loadInfo == nil {
-				loadInfo = &AccountLoadInfo{AccountID: acc.ID}
+			loadInfo := loadInfoOrDefault(loadMap, acc.ID)
+			item := accountWithLoad{
+				account:  acc,
+				loadInfo: loadInfo,
 			}
-			if loadInfo.LoadRate < 100 {
-				available = append(available, accountWithLoad{
-					account:  acc,
-					loadInfo: loadInfo,
-				})
+			waitCandidates = append(waitCandidates, item)
+			// WaitingCount 只用于排序和排队分流，不能把仍有真实槽位的账号误判成“满载”。
+			if hasImmediateConcurrencyCapacity(loadInfo, acc.EffectiveLoadFactor()) {
+				available = append(available, item)
 			}
 		}
 
@@ -1873,6 +1884,28 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 				}
 			}
 			available = newAvailable
+		}
+
+		if len(waitCandidates) > 0 {
+			if platform == PlatformAntigravity {
+				waitCandidates = s.preferDirectAntigravityAccountLoads(ctx, waitCandidates, requestedModel)
+			}
+			sort.SliceStable(waitCandidates, func(i, j int) bool {
+				return s.lessWaitCandidate(ctx, requestedModel, preferOAuth, waitCandidates[i], waitCandidates[j])
+			})
+			for _, item := range waitCandidates {
+				// 会话数量限制检查（等待计划也需要占用会话配额）
+				if !s.checkAndRegisterSession(ctx, item.account, sessionHash) {
+					continue
+				}
+				return s.newSelectionResult(ctx, item.account, false, nil, &AccountWaitPlan{
+					AccountID:      item.account.ID,
+					MaxConcurrency: item.account.Concurrency,
+					Timeout:        cfg.FallbackWaitTimeout,
+					MaxWaiting:     cfg.FallbackMaxWaiting,
+				})
+			}
+			return nil, ErrNoAvailableAccounts
 		}
 	}
 
@@ -2542,6 +2575,71 @@ func (s *GatewayService) lessAntigravityLoadCandidate(ctx context.Context, reque
 		return left.account.ID < right.account.ID
 	default:
 		if left.account.LastUsedAt.Equal(*right.account.LastUsedAt) {
+			return left.account.ID < right.account.ID
+		}
+		return left.account.LastUsedAt.Before(*right.account.LastUsedAt)
+	}
+}
+
+func loadInfoOrDefault(loadMap map[int64]*AccountLoadInfo, accountID int64) *AccountLoadInfo {
+	if loadMap != nil {
+		if loadInfo := loadMap[accountID]; loadInfo != nil {
+			return loadInfo
+		}
+	}
+	return &AccountLoadInfo{AccountID: accountID}
+}
+
+func hasImmediateConcurrencyCapacity(loadInfo *AccountLoadInfo, maxConcurrency int) bool {
+	if maxConcurrency <= 0 {
+		return true
+	}
+	if loadInfo == nil {
+		return true
+	}
+	return loadInfo.CurrentConcurrency < maxConcurrency
+}
+
+func (s *GatewayService) lessWaitCandidate(ctx context.Context, requestedModel string, preferOAuth bool, left, right accountWithLoad) bool {
+	if left.account == nil || right.account == nil {
+		return false
+	}
+	if left.account.Priority != right.account.Priority {
+		return left.account.Priority < right.account.Priority
+	}
+	if better, decided := s.antigravityModelSelectionBetter(ctx, requestedModel, left.account, right.account); decided {
+		return better
+	}
+	if left.loadInfo.WaitingCount != right.loadInfo.WaitingCount {
+		return left.loadInfo.WaitingCount < right.loadInfo.WaitingCount
+	}
+	if left.loadInfo.CurrentConcurrency != right.loadInfo.CurrentConcurrency {
+		return left.loadInfo.CurrentConcurrency < right.loadInfo.CurrentConcurrency
+	}
+	if better, decided := s.antigravityRuntimeBetter(left.account, right.account); decided {
+		return better
+	}
+	if better, decided := antigravityWarmLastUsedBetter(left.account, right.account); decided {
+		return better
+	}
+	if left.loadInfo.LoadRate != right.loadInfo.LoadRate {
+		return left.loadInfo.LoadRate < right.loadInfo.LoadRate
+	}
+	switch {
+	case left.account.LastUsedAt == nil && right.account.LastUsedAt != nil:
+		return true
+	case left.account.LastUsedAt != nil && right.account.LastUsedAt == nil:
+		return false
+	case left.account.LastUsedAt == nil && right.account.LastUsedAt == nil:
+		if preferOAuth && left.account.Type != right.account.Type {
+			return left.account.Type == AccountTypeOAuth
+		}
+		return left.account.ID < right.account.ID
+	default:
+		if left.account.LastUsedAt.Equal(*right.account.LastUsedAt) {
+			if preferOAuth && left.account.Type != right.account.Type {
+				return left.account.Type == AccountTypeOAuth
+			}
 			return left.account.ID < right.account.ID
 		}
 		return left.account.LastUsedAt.Before(*right.account.LastUsedAt)
