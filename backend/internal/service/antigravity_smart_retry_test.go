@@ -337,6 +337,8 @@ func TestHandleSmartRetry_ShortDelay_SmartRetryFailed_ReturnsSwitchError(t *test
 func TestHandleSmartRetry_503_ModelCapacityExhausted_MultiAccountFastFailover(t *testing.T) {
 	resetModelCapacityExhaustedStateForTest(t)
 
+	repo := &stubAntigravityAccountRepo{}
+	cache := &stubSmartRetryCache{}
 	upstream := &mockSmartRetryUpstream{
 		responses: []*http.Response{
 			{
@@ -381,25 +383,38 @@ func TestHandleSmartRetry_503_ModelCapacityExhausted_MultiAccountFastFailover(t 
 	}
 
 	params := antigravityRetryLoopParams{
-		ctx:          context.Background(),
-		prefix:       "[test]",
-		account:      account,
-		accessToken:  "token",
-		action:       "generateContent",
-		body:         []byte(`{"input":"test"}`),
-		httpUpstream: upstream,
+		ctx:             context.Background(),
+		prefix:          "[test]",
+		account:         account,
+		accessToken:     "token",
+		action:          "generateContent",
+		body:            []byte(`{"input":"test"}`),
+		httpUpstream:    upstream,
+		accountRepo:     repo,
+		groupID:         17,
+		sessionHash:     "mce-fast-failover",
+		isStickySession: true,
 		handleError: func(ctx context.Context, prefix string, account *Account, statusCode int, headers http.Header, body []byte, requestedModel string, groupID int64, sessionHash string, isStickySession bool) *handleModelRateLimitResult {
 			return nil
 		},
 	}
 
-	svc := &AntigravityGatewayService{}
+	svc := &AntigravityGatewayService{cache: cache}
 	result := svc.handleSmartRetry(params, resp, respBody, "https://ag-1.test", 0, []string{"https://ag-1.test"})
 
 	require.NotNil(t, result)
 	require.Equal(t, smartRetryActionBreakWithResp, result.action)
-	require.NotNil(t, result.resp, "multi-account model capacity should return response immediately to handler failover")
-	require.Nil(t, result.switchError, "MODEL_CAPACITY_EXHAUSTED should be classified by handler from response body")
+	require.Nil(t, result.resp, "multi-account model capacity should return switchError for handler failover")
+	require.NotNil(t, result.switchError)
+	require.Equal(t, account.ID, result.switchError.OriginalAccountID)
+	require.Equal(t, "gemini-3-pro", result.switchError.RateLimitedModel)
+	require.True(t, result.switchError.IsStickySession)
+	require.True(t, result.switchError.ModelCapacityExhausted)
+	require.Len(t, repo.modelRateLimitCalls, 1, "fast failover should apply short model penalty")
+	require.Equal(t, "gemini-3-pro", repo.modelRateLimitCalls[0].modelKey)
+	require.Len(t, cache.deleteCalls, 1, "fast failover should clear sticky session binding")
+	require.Equal(t, int64(17), cache.deleteCalls[0].groupID)
+	require.Equal(t, "mce-fast-failover", cache.deleteCalls[0].sessionHash)
 	require.Len(t, upstream.calls, 0, "should not perform in-service retries for shared model capacity errors")
 }
 
@@ -479,12 +494,13 @@ func TestHandleSmartRetry_ShortDelay_AfterSwitch_FastFailoverWithoutWaiting(t *t
 }
 
 // 首次响应为 429 短延迟时会进入智能重试；若最后一次重试结果漂移为
-// 503 MODEL_CAPACITY_EXHAUSTED，则应按“共享容量不足”返回上游 503，
-// 而不是继续按账号级限流切换账号。
+// 503 MODEL_CAPACITY_EXHAUSTED，则应按“共享容量不足”对当前账号做短惩罚，
+// 并触发多账号 failover，而不是继续停留在当前账号上。
 func TestHandleSmartRetry_ReclassifiesFinalModelCapacityExhausted(t *testing.T) {
 	resetModelCapacityExhaustedStateForTest(t)
 
 	repo := &stubAntigravityAccountRepo{}
+	cache := &stubSmartRetryCache{}
 	account := &Account{
 		ID:       21,
 		Name:     "acc-21",
@@ -530,30 +546,39 @@ func TestHandleSmartRetry_ReclassifiesFinalModelCapacityExhausted(t *testing.T) 
 	}
 
 	params := antigravityRetryLoopParams{
-		ctx:          context.Background(),
-		prefix:       "[test]",
-		account:      account,
-		accessToken:  "token",
-		action:       "generateContent",
-		body:         []byte(`{"input":"test"}`),
-		httpUpstream: upstream,
-		accountRepo:  repo,
+		ctx:             context.Background(),
+		prefix:          "[test]",
+		account:         account,
+		accessToken:     "token",
+		action:          "generateContent",
+		body:            []byte(`{"input":"test"}`),
+		httpUpstream:    upstream,
+		accountRepo:     repo,
+		groupID:         23,
+		sessionHash:     "mce-final",
+		isStickySession: true,
 		handleError: func(ctx context.Context, prefix string, account *Account, statusCode int, headers http.Header, body []byte, requestedModel string, groupID int64, sessionHash string, isStickySession bool) *handleModelRateLimitResult {
 			return nil
 		},
 	}
 
-	svc := &AntigravityGatewayService{}
+	svc := &AntigravityGatewayService{cache: cache}
 	result := svc.handleSmartRetry(params, initialResp, initialRespBody, "https://ag-1.test", 0, []string{"https://ag-1.test"})
 
 	require.NotNil(t, result)
 	require.Equal(t, smartRetryActionBreakWithResp, result.action)
-	require.NotNil(t, result.resp, "final model capacity exhausted should return upstream response")
-	require.Equal(t, http.StatusServiceUnavailable, result.resp.StatusCode)
-	require.Equal(t, "1", result.resp.Header.Get("X-Final"), "should preserve final retry response headers")
+	require.Nil(t, result.resp, "final model capacity exhausted should switch account in multi-account mode")
 	require.Nil(t, result.err)
-	require.Nil(t, result.switchError, "final model capacity exhausted should not switch account")
-	require.Empty(t, repo.modelRateLimitCalls, "final model capacity exhausted should not set model rate limit")
+	require.NotNil(t, result.switchError)
+	require.Equal(t, account.ID, result.switchError.OriginalAccountID)
+	require.Equal(t, "claude-opus-4-6-thinking", result.switchError.RateLimitedModel)
+	require.True(t, result.switchError.IsStickySession)
+	require.True(t, result.switchError.ModelCapacityExhausted)
+	require.Len(t, repo.modelRateLimitCalls, 1, "final model capacity exhausted should apply short model penalty")
+	require.Equal(t, "claude-opus-4-6-thinking", repo.modelRateLimitCalls[0].modelKey)
+	require.Len(t, cache.deleteCalls, 1, "final model capacity exhausted should clear sticky session binding")
+	require.Equal(t, int64(23), cache.deleteCalls[0].groupID)
+	require.Equal(t, "mce-final", cache.deleteCalls[0].sessionHash)
 	require.Len(t, upstream.calls, 1, "should have made exactly one smart retry")
 }
 

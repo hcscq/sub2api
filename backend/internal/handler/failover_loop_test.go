@@ -57,7 +57,7 @@ func TestNewFailoverState(t *testing.T) {
 		require.False(t, fs.ForceCacheBilling)
 		require.True(t, fs.hasBoundSession)
 		require.False(t, fs.singleAccountBackoff)
-		require.Zero(t, fs.modelCapacityBackoffs)
+		require.Zero(t, fs.modelCapacitySwitches)
 	})
 
 	t.Run("无绑定会话", func(t *testing.T) {
@@ -226,7 +226,7 @@ func TestHandleFailoverError_BasicSwitch(t *testing.T) {
 		require.Contains(t, fs.FailedAccountIDs, int64(100))
 	})
 
-	t.Run("MODEL_CAPACITY_EXHAUSTED 在多账号场景执行一次共享回退", func(t *testing.T) {
+	t.Run("MODEL_CAPACITY_EXHAUSTED 在多账号场景执行有限跨账号切换", func(t *testing.T) {
 		mock := &mockTempUnscheduler{}
 		fs := NewFailoverState(3, false)
 		fs.FailedAccountIDs[42] = struct{}{}
@@ -238,13 +238,13 @@ func TestHandleFailoverError_BasicSwitch(t *testing.T) {
 		elapsed := time.Since(start)
 
 		require.Equal(t, FailoverContinue, action)
-		require.Equal(t, 0, fs.SwitchCount)
-		require.Empty(t, fs.FailedAccountIDs)
+		require.Equal(t, 1, fs.SwitchCount)
+		require.Contains(t, fs.FailedAccountIDs, int64(42))
+		require.Contains(t, fs.FailedAccountIDs, int64(100))
 		require.Equal(t, err, fs.LastFailoverErr)
-		require.Equal(t, 1, fs.modelCapacityBackoffs)
+		require.Equal(t, 1, fs.modelCapacitySwitches)
 		require.Empty(t, mock.calls)
-		require.GreaterOrEqual(t, elapsed, 1500*time.Millisecond, "应等待约 2s 的共享回退")
-		require.Less(t, elapsed, 5*time.Second)
+		require.Less(t, elapsed, 200*time.Millisecond, "多账号模型容量切换不应额外等待")
 	})
 
 	t.Run("MODEL_CAPACITY_EXHAUSTED 在单账号场景仍进入外层回退", func(t *testing.T) {
@@ -261,12 +261,12 @@ func TestHandleFailoverError_BasicSwitch(t *testing.T) {
 		require.Contains(t, fs.FailedAccountIDs, int64(100))
 	})
 
-	t.Run("MODEL_CAPACITY_EXHAUSTED 共享回退超过上限后直接Exhausted", func(t *testing.T) {
+	t.Run("MODEL_CAPACITY_EXHAUSTED 跨账号切换超过上限后直接Exhausted", func(t *testing.T) {
 		mock := &mockTempUnscheduler{}
 		fs := NewFailoverState(5, false)
 		fs.SwitchCount = 1
 		fs.FailedAccountIDs[55] = struct{}{}
-		fs.modelCapacityBackoffs = maxModelCapacityBackoffs
+		fs.modelCapacitySwitches = maxModelCapacitySwitches
 		err := newTestFailoverErr(503, false, false)
 		err.ModelCapacityExhausted = true
 
@@ -276,10 +276,11 @@ func TestHandleFailoverError_BasicSwitch(t *testing.T) {
 
 		require.Equal(t, FailoverExhausted, action)
 		require.Equal(t, 1, fs.SwitchCount)
-		require.Len(t, fs.FailedAccountIDs, 1)
-		require.NotContains(t, fs.FailedAccountIDs, int64(100))
-		require.Equal(t, maxModelCapacityBackoffs, fs.modelCapacityBackoffs)
-		require.Less(t, elapsed, 200*time.Millisecond, "共享回退次数用尽后应立即结束")
+		require.Len(t, fs.FailedAccountIDs, 2)
+		require.Contains(t, fs.FailedAccountIDs, int64(55))
+		require.Contains(t, fs.FailedAccountIDs, int64(100))
+		require.Equal(t, maxModelCapacitySwitches, fs.modelCapacitySwitches)
+		require.Less(t, elapsed, 200*time.Millisecond, "模型容量切换次数用尽后应立即结束")
 	})
 }
 
@@ -818,7 +819,7 @@ func TestHandleSelectionExhausted(t *testing.T) {
 
 		require.Equal(t, FailoverExhausted, action)
 		require.Contains(t, fs.FailedAccountIDs, int64(100))
-		require.Zero(t, fs.modelCapacityBackoffs)
-		require.Less(t, elapsed, 100*time.Millisecond, "共享回退应已在 HandleFailoverError 中处理，不应在选号耗尽时再次等待")
+		require.Zero(t, fs.modelCapacitySwitches)
+		require.Less(t, elapsed, 100*time.Millisecond, "多账号模型容量切换不应在选号耗尽时再次等待")
 	})
 }

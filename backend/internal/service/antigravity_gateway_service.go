@@ -43,11 +43,11 @@ const (
 	antigravityDefaultRateLimitDuration = 30 * time.Second // 默认限流时间（无 retryDelay 时使用）
 
 	// MODEL_CAPACITY_EXHAUSTED 专用重试参数
-	// 模型容量不足时，所有账号共享同一容量池，切换账号无意义
-	// 使用固定 1s 间隔做少量原地重试，避免在单账号上卡住过久。
-	// 更长的退避交给 handler 层的切号/单账号回退循环处理。
+	// 模型容量不足时，Service 层只做少量原地重试；多账号场景会优先交给
+	// Handler 层做有限跨账号 failover，避免直接把瞬时容量抖动暴露给下游。
 	antigravityModelCapacityRetryMaxAttempts = 3
 	antigravityModelCapacityRetryWait        = 1 * time.Second
+	antigravityModelCapacityFailoverPenalty  = 15 * time.Second
 
 	// Google RPC 状态和类型常量
 	googleRPCStatusResourceExhausted      = "RESOURCE_EXHAUSTED"
@@ -94,9 +94,10 @@ const (
 // AntigravityAccountSwitchError 账号切换信号
 // 当账号限流时间超过阈值时，通知上层切换账号
 type AntigravityAccountSwitchError struct {
-	OriginalAccountID int64
-	RateLimitedModel  string
-	IsStickySession   bool // 是否为粘性会话切换（决定是否缓存计费）
+	OriginalAccountID      int64
+	RateLimitedModel       string
+	IsStickySession        bool // 是否为粘性会话切换（决定是否缓存计费）
+	ModelCapacityExhausted bool // 是否因共享模型容量不足触发切换
 }
 
 func (e *AntigravityAccountSwitchError) Error() string {
@@ -263,15 +264,12 @@ func (s *AntigravityGatewayService) handleSmartRetry(p antigravityRetryLoopParam
 	if shouldSmartRetry {
 		if shouldPreferAntigravityFastFailover(p.ctx, isModelCapacityExhausted) {
 			if isModelCapacityExhausted {
-				logger.LegacyPrintf("service.antigravity_gateway", "%s status=%d model_capacity_fast_failover model=%s account=%d body=%s (skip in-service retry, defer to handler backoff)",
-					p.prefix, resp.StatusCode, modelName, p.account.ID, truncateForLog(respBody, 200))
+				switchCount, _ := AccountSwitchCountFromContext(p.ctx)
+				logger.LegacyPrintf("service.antigravity_gateway", "%s status=%d model_capacity_fast_failover model=%s account=%d switch_count=%d penalty=%v body=%s (skip in-service retry, switch account)",
+					p.prefix, resp.StatusCode, modelName, p.account.ID, switchCount, antigravityModelCapacityFailoverPenalty, truncateForLog(respBody, 200))
 				return &smartRetryResult{
-					action: smartRetryActionBreakWithResp,
-					resp: &http.Response{
-						StatusCode: resp.StatusCode,
-						Header:     resp.Header.Clone(),
-						Body:       io.NopCloser(bytes.NewReader(respBody)),
-					},
+					action:      smartRetryActionBreakWithResp,
+					switchError: s.buildModelCapacitySwitchError(p, resp.StatusCode, modelName, false),
 				}
 			}
 
@@ -425,8 +423,8 @@ func (s *AntigravityGatewayService) handleSmartRetry(p antigravityRetryLoopParam
 			rateLimitDuration = antigravityDefaultRateLimitDuration
 		}
 
-		// MODEL_CAPACITY_EXHAUSTED：模型容量不足，切换账号无意义
-		// 直接返回上游错误响应，不设置模型限流，不切换账号
+		// MODEL_CAPACITY_EXHAUSTED：单账号模式直接返回 503，让外层回退处理；
+		// 多账号模式对当前账号做短惩罚，并触发有限跨账号 failover。
 		if finalIsModelCapacityExhausted {
 			// 设置 cooldown，让后续请求快速失败，避免重复重试
 			if finalModelName != "" {
@@ -434,15 +432,23 @@ func (s *AntigravityGatewayService) handleSmartRetry(p antigravityRetryLoopParam
 				modelCapacityExhaustedUntil[finalModelName] = time.Now().Add(antigravityModelCapacityCooldown)
 				modelCapacityExhaustedMu.Unlock()
 			}
-			log.Printf("%s status=%d smart_retry_exhausted_model_capacity attempts=%d model=%s account=%d body=%s (model capacity exhausted, not switching account)",
-				p.prefix, finalStatusCode, maxAttempts, finalModelName, p.account.ID, truncateForLog(retryBody, 200))
+			if isSingleAccountRetry(p.ctx) {
+				log.Printf("%s status=%d smart_retry_exhausted_model_capacity attempts=%d model=%s account=%d body=%s (model capacity exhausted, not switching account)",
+					p.prefix, finalStatusCode, maxAttempts, finalModelName, p.account.ID, truncateForLog(retryBody, 200))
+				return &smartRetryResult{
+					action: smartRetryActionBreakWithResp,
+					resp: &http.Response{
+						StatusCode: finalStatusCode,
+						Header:     finalHeaders,
+						Body:       io.NopCloser(bytes.NewReader(retryBody)),
+					},
+				}
+			}
+			log.Printf("%s status=%d smart_retry_exhausted_model_capacity attempts=%d model=%s account=%d penalty=%v body=%s (switch account)",
+				p.prefix, finalStatusCode, maxAttempts, finalModelName, p.account.ID, antigravityModelCapacityFailoverPenalty, truncateForLog(retryBody, 200))
 			return &smartRetryResult{
-				action: smartRetryActionBreakWithResp,
-				resp: &http.Response{
-					StatusCode: finalStatusCode,
-					Header:     finalHeaders,
-					Body:       io.NopCloser(bytes.NewReader(retryBody)),
-				},
+				action:      smartRetryActionBreakWithResp,
+				switchError: s.buildModelCapacitySwitchError(p, finalStatusCode, finalModelName, true),
 			}
 		}
 
@@ -504,6 +510,27 @@ func shouldPreferAntigravityFastFailover(ctx context.Context, isModelCapacityExh
 	}
 	switchCount, ok := AccountSwitchCountFromContext(ctx)
 	return ok && switchCount > 0
+}
+
+func (s *AntigravityGatewayService) buildModelCapacitySwitchError(
+	p antigravityRetryLoopParams,
+	statusCode int,
+	modelName string,
+	afterSmartRetry bool,
+) *AntigravityAccountSwitchError {
+	resetAt := time.Now().Add(antigravityModelCapacityFailoverPenalty)
+	if setModelRateLimitByModelName(p.ctx, p.accountRepo, p.account.ID, modelName, p.prefix, statusCode, resetAt, afterSmartRetry) {
+		s.updateAccountModelRateLimitInCache(p.ctx, p.account, modelName, resetAt)
+	}
+	if s.cache != nil && p.sessionHash != "" {
+		_ = s.cache.DeleteSessionAccountID(p.ctx, p.groupID, p.sessionHash)
+	}
+	return &AntigravityAccountSwitchError{
+		OriginalAccountID:      p.account.ID,
+		RateLimitedModel:       modelName,
+		IsStickySession:        p.isStickySession,
+		ModelCapacityExhausted: true,
+	}
 }
 
 // handleSingleAccountRetryInPlace 单账号 503 退避重试的原地重试逻辑。
@@ -1519,8 +1546,9 @@ func (s *AntigravityGatewayService) Forward(ctx context.Context, c *gin.Context,
 		// 检查是否是账号切换信号，转换为 UpstreamFailoverError 让 Handler 切换账号
 		if switchErr, ok := IsAntigravityAccountSwitchError(err); ok {
 			return nil, &UpstreamFailoverError{
-				StatusCode:        http.StatusServiceUnavailable,
-				ForceCacheBilling: switchErr.IsStickySession,
+				StatusCode:             http.StatusServiceUnavailable,
+				ForceCacheBilling:      switchErr.IsStickySession,
+				ModelCapacityExhausted: switchErr.ModelCapacityExhausted,
 			}
 		}
 		// 区分客户端取消和真正的上游失败，返回更准确的错误消息
@@ -2283,8 +2311,9 @@ func (s *AntigravityGatewayService) ForwardGemini(ctx context.Context, c *gin.Co
 		// 检查是否是账号切换信号，转换为 UpstreamFailoverError 让 Handler 切换账号
 		if switchErr, ok := IsAntigravityAccountSwitchError(err); ok {
 			return nil, &UpstreamFailoverError{
-				StatusCode:        http.StatusServiceUnavailable,
-				ForceCacheBilling: switchErr.IsStickySession,
+				StatusCode:             http.StatusServiceUnavailable,
+				ForceCacheBilling:      switchErr.IsStickySession,
+				ModelCapacityExhausted: switchErr.ModelCapacityExhausted,
 			}
 		}
 		// 区分客户端取消和真正的上游失败，返回更准确的错误消息
@@ -2418,8 +2447,9 @@ func (s *AntigravityGatewayService) ForwardGemini(ctx context.Context, c *gin.Co
 							Message:            sanitizeUpstreamErrorMessage(retryErr.Error()),
 						})
 						return nil, &UpstreamFailoverError{
-							StatusCode:        http.StatusServiceUnavailable,
-							ForceCacheBilling: switchErr.IsStickySession,
+							StatusCode:             http.StatusServiceUnavailable,
+							ForceCacheBilling:      switchErr.IsStickySession,
+							ModelCapacityExhausted: switchErr.ModelCapacityExhausted,
 						}
 					}
 					appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
