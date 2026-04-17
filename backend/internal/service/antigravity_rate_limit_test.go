@@ -87,6 +87,7 @@ type stubAntigravityAccountRepo struct {
 	rateCalls           []rateLimitCall
 	modelRateLimitCalls []modelRateLimitCall
 	extraUpdateCalls    []extraUpdateCall
+	setErrorCalls       []setErrorCall
 }
 
 func (s *stubAntigravityAccountRepo) SetRateLimited(ctx context.Context, id int64, resetAt time.Time) error {
@@ -101,6 +102,11 @@ func (s *stubAntigravityAccountRepo) SetModelRateLimit(ctx context.Context, id i
 
 func (s *stubAntigravityAccountRepo) UpdateExtra(ctx context.Context, id int64, updates map[string]any) error {
 	s.extraUpdateCalls = append(s.extraUpdateCalls, extraUpdateCall{accountID: id, updates: updates})
+	return nil
+}
+
+func (s *stubAntigravityAccountRepo) SetError(ctx context.Context, id int64, errorMsg string) error {
+	s.setErrorCalls = append(s.setErrorCalls, setErrorCall{accountID: id, reason: errorMsg})
 	return nil
 }
 
@@ -228,8 +234,10 @@ func TestHandleUpstreamError_429_NonModelRateLimit_UsesMappedModelKey(t *testing
 // MODEL_CAPACITY_EXHAUSTED 时应等待重试，不切换账号
 func TestHandleUpstreamError_503_ModelCapacityExhausted(t *testing.T) {
 	repo := &stubAntigravityAccountRepo{}
-	svc := &AntigravityGatewayService{accountRepo: repo}
+	cache := &stubSmartRetryCache{}
+	svc := &AntigravityGatewayService{accountRepo: repo, cache: cache}
 	account := &Account{ID: 3, Name: "acc-3", Platform: PlatformAntigravity}
+	before := time.Now()
 
 	// 503 + MODEL_CAPACITY_EXHAUSTED → 等待重试，不切换账号
 	body := []byte(`{
@@ -242,21 +250,27 @@ func TestHandleUpstreamError_503_ModelCapacityExhausted(t *testing.T) {
 		}
 	}`)
 
-	result := svc.handleUpstreamError(context.Background(), "[test]", account, http.StatusServiceUnavailable, http.Header{}, body, "gemini-3-pro-high", 0, "", false)
+	result := svc.handleUpstreamError(context.Background(), "[test]", account, http.StatusServiceUnavailable, http.Header{}, body, "gemini-3-pro-high", 7, "sticky-capacity", true)
 
-	// MODEL_CAPACITY_EXHAUSTED 应该标记为已处理，不切换账号，不设置模型限流
-	// 实际重试由 handleSmartRetry 处理
+	// MODEL_CAPACITY_EXHAUSTED 应该标记为已处理，不切换账号；
+	// 但会给当前账号打一个很短的模型冷却，避免立刻被重新选中。
 	require.NotNil(t, result)
 	require.True(t, result.Handled)
 	require.False(t, result.ShouldRetry, "MODEL_CAPACITY_EXHAUSTED should not trigger retry from handleModelRateLimit path")
 	require.Nil(t, result.SwitchError, "MODEL_CAPACITY_EXHAUSTED should not trigger account switch")
-	require.Empty(t, repo.modelRateLimitCalls, "MODEL_CAPACITY_EXHAUSTED should not set model rate limit")
+	require.Len(t, repo.modelRateLimitCalls, 1, "MODEL_CAPACITY_EXHAUSTED should set a short model cooldown")
+	require.Equal(t, "gemini-3-pro-high", repo.modelRateLimitCalls[0].modelKey)
+	require.WithinDuration(t, before.Add(antigravityModelCapacityCooldown), repo.modelRateLimitCalls[0].resetAt, 2*time.Second)
+	require.Len(t, cache.deleteCalls, 1, "MODEL_CAPACITY_EXHAUSTED should clear sticky session binding")
+	require.Equal(t, int64(7), cache.deleteCalls[0].groupID)
+	require.Equal(t, "sticky-capacity", cache.deleteCalls[0].sessionHash)
 }
 
 func TestHandleUpstreamError_503_ModelCapacityExhausted_FinalRetryBody(t *testing.T) {
 	repo := &stubAntigravityAccountRepo{}
 	svc := &AntigravityGatewayService{accountRepo: repo}
 	account := &Account{ID: 301, Name: "acc-301", Platform: PlatformAntigravity}
+	before := time.Now()
 
 	// smart retry 耗尽后，外层仍保持 503，但最终重试响应体可能退化为 429/message。
 	body := []byte(`{
@@ -277,7 +291,9 @@ func TestHandleUpstreamError_503_ModelCapacityExhausted_FinalRetryBody(t *testin
 	require.True(t, result.Handled)
 	require.False(t, result.ShouldRetry)
 	require.Nil(t, result.SwitchError, "final retry body from shared capacity exhaustion should not trigger account switch")
-	require.Empty(t, repo.modelRateLimitCalls, "shared model capacity exhaustion should not set model rate limit")
+	require.Len(t, repo.modelRateLimitCalls, 1, "shared model capacity exhaustion should set a short model cooldown")
+	require.Equal(t, "gemini-3-pro-high", repo.modelRateLimitCalls[0].modelKey)
+	require.WithinDuration(t, before.Add(antigravityModelCapacityCooldown), repo.modelRateLimitCalls[0].resetAt, 2*time.Second)
 }
 
 // TestHandleUpstreamError_503_NonModelRateLimit 测试 503 非模型限流场景（不处理）
@@ -303,6 +319,67 @@ func TestHandleUpstreamError_503_NonModelRateLimit(t *testing.T) {
 	require.Nil(t, result)
 	require.Empty(t, repo.modelRateLimitCalls, "503 non-model rate limit should not trigger model rate limit")
 	require.Empty(t, repo.rateCalls, "503 non-model rate limit should not trigger account rate limit")
+	require.Empty(t, repo.setErrorCalls, "503 non-model rate limit should not disable account")
+}
+
+func TestHandleUpstreamError_WrappedAntigravityForbidden_DisablesAccount(t *testing.T) {
+	tests := []struct {
+		name             string
+		statusCode       int
+		body             []byte
+		expectedContains []string
+	}{
+		{
+			name:       "502 validation",
+			statusCode: http.StatusBadGateway,
+			body: []byte(`{
+				"error": {
+					"message": "VALIDATION_REQUIRED",
+					"details": [
+						{"metadata": {"validation_url": "https://accounts.google.com/verify?token=abc"}}
+					]
+				}
+			}`),
+			expectedContains: []string{
+				"Validation required (403)",
+				"validation_url: https://accounts.google.com/verify?token=abc",
+			},
+		},
+		{
+			name:       "503 violation",
+			statusCode: http.StatusServiceUnavailable,
+			body: []byte(`{
+				"error": {
+					"message": "Your account has been suspended for Terms of Service violation"
+				}
+			}`),
+			expectedContains: []string{
+				"Account violation (403)",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := &stubAntigravityAccountRepo{}
+			svc := &AntigravityGatewayService{
+				accountRepo:      repo,
+				rateLimitService: &RateLimitService{accountRepo: repo},
+			}
+			account := &Account{ID: 77, Name: "acc-77", Platform: PlatformAntigravity, Type: AccountTypeOAuth}
+
+			result := svc.handleUpstreamError(context.Background(), "[test]", account, tt.statusCode, http.Header{}, tt.body, "gemini-3-pro-high", 0, "", false)
+
+			require.Nil(t, result)
+			require.Len(t, repo.setErrorCalls, 1, "wrapped forbidden should disable account")
+			require.Equal(t, int64(77), repo.setErrorCalls[0].accountID)
+			for _, want := range tt.expectedContains {
+				require.Contains(t, repo.setErrorCalls[0].reason, want)
+			}
+			require.Empty(t, repo.modelRateLimitCalls, "wrapped forbidden should not write model cooldown")
+			require.Empty(t, repo.rateCalls, "wrapped forbidden should not write account rate limit")
+		})
+	}
 }
 
 // TestHandleUpstreamError_503_EmptyBody 测试 503 空响应体（不处理）

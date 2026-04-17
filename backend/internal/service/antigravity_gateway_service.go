@@ -2833,9 +2833,47 @@ type handleModelRateLimitResult struct {
 	SwitchError  *AntigravityAccountSwitchError // 账号切换错误
 }
 
+func (s *AntigravityGatewayService) setModelCapacityCooldownAndClearSession(p *handleModelRateLimitParams, info *antigravitySmartRetryInfo) {
+	if p == nil || p.account == nil || info == nil {
+		return
+	}
+	modelName := strings.TrimSpace(info.ModelName)
+	if modelName == "" {
+		return
+	}
+
+	resetAt := time.Now().Add(antigravityModelCapacityCooldown)
+	logger.LegacyPrintf("service.antigravity_gateway", "%s status=%d model_capacity_cooldown model=%s account=%d reset_in=%v",
+		p.prefix, p.statusCode, modelName, p.account.ID, antigravityModelCapacityCooldown)
+
+	if s.accountRepo != nil {
+		if err := s.accountRepo.SetModelRateLimit(p.ctx, p.account.ID, modelName, resetAt); err != nil {
+			logger.LegacyPrintf("service.antigravity_gateway", "%s model_capacity_cooldown_set_failed model=%s error=%v",
+				p.prefix, modelName, err)
+		}
+	}
+	s.updateAccountModelRateLimitInCache(p.ctx, p.account, modelName, resetAt)
+
+	if p.cache != nil && p.sessionHash != "" {
+		_ = p.cache.DeleteSessionAccountID(p.ctx, p.groupID, p.sessionHash)
+	}
+}
+
+func isWrappedAntigravityForbiddenStatus(statusCode int, body []byte) bool {
+	if statusCode != http.StatusBadGateway && statusCode != http.StatusServiceUnavailable {
+		return false
+	}
+	switch classifyForbiddenType(string(body)) {
+	case forbiddenTypeValidation, forbiddenTypeViolation:
+		return true
+	default:
+		return false
+	}
+}
+
 // handleModelRateLimit 处理模型级限流（在原有逻辑之前调用）
 // 仅处理 429/503，解析模型名和 retryDelay
-// - MODEL_CAPACITY_EXHAUSTED: 返回 Handled=true（实际重试由 handleSmartRetry 处理）
+// - MODEL_CAPACITY_EXHAUSTED: 返回 Handled=true，并写入一个很短的模型冷却，避免立刻再次选中同账号
 // - RATE_LIMIT_EXCEEDED + retryDelay < 阈值: 返回 ShouldRetry=true，由调用方等待后重试
 // - RATE_LIMIT_EXCEEDED + retryDelay >= 阈值: 设置模型限流 + 清除粘性会话 + 返回 SwitchError
 func (s *AntigravityGatewayService) handleModelRateLimit(p *handleModelRateLimitParams) *handleModelRateLimitResult {
@@ -2857,8 +2895,9 @@ func (s *AntigravityGatewayService) handleModelRateLimit(p *handleModelRateLimit
 	}
 
 	// MODEL_CAPACITY_EXHAUSTED：模型容量不足，所有账号共享同一容量池
-	// 切换账号无意义，不设置模型限流（实际重试由 handleSmartRetry 处理）
+	// 切换账号无意义，但仍给当前账号写一个很短的模型冷却，避免 failover/backoff 后再次立刻命中同一账号。
 	if info.IsModelCapacityExhausted {
+		s.setModelCapacityCooldownAndClearSession(p, info)
 		log.Printf("%s status=%d model_capacity_exhausted model=%s (not switching account, retry handled by smart retry)",
 			p.prefix, p.statusCode, info.ModelName)
 		return &handleModelRateLimitResult{
@@ -2966,6 +3005,19 @@ func (s *AntigravityGatewayService) handleUpstreamError(
 	})
 	if result.Handled {
 		return result
+	}
+
+	// Antigravity 有时会把真实的 403 validation / violation 包在 502/503 里透出。
+	// 这类账号应按 403 永久摘除，避免继续进入调度池。
+	if account.Platform == PlatformAntigravity && isWrappedAntigravityForbiddenStatus(statusCode, body) {
+		if s.rateLimitService == nil {
+			return nil
+		}
+		shouldDisable := s.rateLimitService.HandleUpstreamError(ctx, account, http.StatusForbidden, headers, body)
+		if shouldDisable {
+			logger.LegacyPrintf("service.antigravity_gateway", "%s status=%d wrapped_forbidden_marked_error", prefix, statusCode)
+		}
+		return nil
 	}
 
 	// 503 仅处理模型限流（MODEL_CAPACITY_EXHAUSTED），非模型限流不做额外处理
