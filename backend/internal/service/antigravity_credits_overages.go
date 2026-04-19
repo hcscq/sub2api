@@ -211,16 +211,6 @@ func (s *AntigravityGatewayService) clearCreditsExhausted(ctx context.Context, a
 	}
 }
 
-func clearCreditsExhaustedState(ctx context.Context, repo AccountRepository, account *Account) error {
-	_, err := clearCreditsRateLimitKeys(ctx, repo, account, creditsExhaustedKey)
-	return err
-}
-
-func clearCreditsRequestInsufficientState(ctx context.Context, repo AccountRepository, account *Account) error {
-	_, err := clearCreditsRateLimitKeys(ctx, repo, account, creditsRequestInsufficientKey)
-	return err
-}
-
 func clearCreditsSelectionState(ctx context.Context, repo AccountRepository, account *Account) error {
 	_, err := clearCreditsRateLimitKeys(ctx, repo, account, creditsExhaustedKey, creditsRequestInsufficientKey)
 	return err
