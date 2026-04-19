@@ -555,6 +555,11 @@ func shouldClearStickySession(account *Account, requestedModel string) bool {
 	if account.TempUnschedulableUntil != nil && time.Now().Before(*account.TempUnschedulableUntil) {
 		return true
 	}
+	// Antigravity 的“需要积分”状态（普通模型限流或 overages 运行态）都要清理 sticky，
+	// 避免会话持续绑定到只能走 credits 的账号。
+	if account.Platform == PlatformAntigravity && account.requiresAntigravityCreditsForModelWithContext(context.Background(), requestedModel) {
+		return true
+	}
 	// 检查模型限流和 scope 限流，有限流即清除粘性会话
 	if remaining := account.GetRateLimitRemainingTimeWithContext(context.Background(), requestedModel); remaining > 0 {
 		return true
@@ -2255,7 +2260,7 @@ func (s *GatewayService) antigravityModelSelectionMode(ctx context.Context, acco
 	if !account.IsSchedulable() {
 		return antigravityModelSelectionUnavailable
 	}
-	if !account.isModelRateLimitedWithContext(ctx, requestedModel) {
+	if !account.requiresAntigravityCreditsForModelWithContext(ctx, requestedModel) {
 		return antigravityModelSelectionDirect
 	}
 	if account.IsOveragesEnabled() && !account.isCreditsExhausted() {

@@ -1628,7 +1628,7 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 		}
 		account.Extra = input.Extra
 		if account.Platform == PlatformAntigravity && wasOveragesEnabled && !account.IsOveragesEnabled() {
-			delete(account.Extra, "antigravity_credits_overages") // 清理旧版 overages 运行态
+			clearAntigravityCreditsOveragesRuntimeState(account.Extra)
 			// 清除 AICredits 限流 key
 			if rawLimits, ok := account.Extra[modelRateLimitsKey].(map[string]any); ok {
 				delete(rawLimits, creditsExhaustedKey)
@@ -1636,7 +1636,7 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 		}
 		if account.Platform == PlatformAntigravity && !wasOveragesEnabled && account.IsOveragesEnabled() {
 			delete(account.Extra, modelRateLimitsKey)
-			delete(account.Extra, "antigravity_credits_overages") // 清理旧版 overages 运行态
+			clearAntigravityCreditsOveragesRuntimeState(account.Extra)
 		}
 		// 校验并预计算固定时间重置的下次重置时间
 		if err := ValidateQuotaResetConfig(account.Extra); err != nil {

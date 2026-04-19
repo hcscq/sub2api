@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,10 +17,23 @@ import (
 const (
 	// creditsExhaustedKey 是 model_rate_limits 中标记积分耗尽的特殊 key。
 	// 与普通模型限流完全同构：通过 SetModelRateLimit / isRateLimitActiveForKey 读写。
-	creditsExhaustedKey      = "AICredits"
-	creditsExhaustedDuration = 5 * time.Hour
-	googleOneAICreditType    = "GOOGLE_ONE_AI"
-	creditsBalanceCheckTTL   = 8 * time.Second
+	creditsExhaustedKey                = "AICredits"
+	creditsRequestInsufficientKey      = "AICreditsRequestInsufficient"
+	antigravityCreditsOveragesStateKey = "antigravity_credits_overages"
+	creditsExhaustedDuration           = 5 * time.Hour
+	creditsRequestInsufficientCooldown = 15 * time.Minute
+	creditsOveragesMinimumCooldown     = 15 * time.Minute
+	creditsOveragesDefaultCooldown     = 5 * time.Hour
+	googleOneAICreditType              = "GOOGLE_ONE_AI"
+	creditsBalanceCheckTTL             = 8 * time.Second
+	creditsAmountField                 = "confirmed_credit_amount"
+	creditsMinimumBalanceField         = "minimum_balance"
+	creditsReasonField                 = "reason"
+	creditsRequestInsufficientReason   = "request_insufficient"
+	creditsActiveUntilField            = "active_until"
+	creditsActivatedAtField            = "activated_at"
+	creditsLastSuccessAtField          = "last_success_at"
+	creditsOveragesActiveReason        = "quota_exhausted"
 )
 
 type antigravity429Category string
@@ -62,12 +76,113 @@ var (
 	}
 )
 
+func buildAntigravityCreditsOveragesExtraKey(modelKey string) string {
+	normalized := normalizeAntigravityModelName(modelKey)
+	if normalized == "" {
+		return ""
+	}
+	return antigravityCreditsOveragesStateKey + ":" + normalized
+}
+
+func isAntigravityCreditsOveragesRuntimeKey(key string) bool {
+	key = strings.TrimSpace(key)
+	return key == antigravityCreditsOveragesStateKey || strings.HasPrefix(key, antigravityCreditsOveragesStateKey+":")
+}
+
+func clearAntigravityCreditsOveragesRuntimeState(extra map[string]any) {
+	if extra == nil {
+		return
+	}
+	for key := range extra {
+		if isAntigravityCreditsOveragesRuntimeKey(key) {
+			delete(extra, key)
+		}
+	}
+}
+
+func parseExtraTime(v any) (time.Time, bool) {
+	switch value := v.(type) {
+	case string:
+		if parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(value)); err == nil {
+			return parsed, true
+		}
+		if parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(value)); err == nil {
+			return parsed, true
+		}
+	case time.Time:
+		return value, true
+	}
+	return time.Time{}, false
+}
+
+func (a *Account) antigravityCreditsOveragesActiveUntilByModelKey(modelKey string) *time.Time {
+	if a == nil || a.Platform != PlatformAntigravity || a.Extra == nil {
+		return nil
+	}
+	extraKey := buildAntigravityCreditsOveragesExtraKey(modelKey)
+	if extraKey == "" {
+		return nil
+	}
+	rawState, ok := a.Extra[extraKey].(map[string]any)
+	if !ok {
+		return nil
+	}
+	activeUntil, ok := parseExtraTime(rawState[creditsActiveUntilField])
+	if !ok {
+		return nil
+	}
+	return &activeUntil
+}
+
+func (a *Account) getAntigravityCreditsOveragesRemainingByModelKey(modelKey string) time.Duration {
+	activeUntil := a.antigravityCreditsOveragesActiveUntilByModelKey(modelKey)
+	if activeUntil == nil {
+		return 0
+	}
+	if remaining := time.Until(*activeUntil); remaining > 0 {
+		return remaining
+	}
+	return 0
+}
+
+func (a *Account) isAntigravityCreditsOveragesActiveWithContext(ctx context.Context, requestedModel string) bool {
+	if a == nil || a.Platform != PlatformAntigravity {
+		return false
+	}
+	modelKey := resolveCreditsOveragesModelKey(ctx, a, "", requestedModel)
+	return a.getAntigravityCreditsOveragesRemainingByModelKey(modelKey) > 0
+}
+
+func (a *Account) requiresAntigravityCreditsForModelWithContext(ctx context.Context, requestedModel string) bool {
+	if a == nil || a.Platform != PlatformAntigravity {
+		return false
+	}
+	if a.isModelRateLimitedWithContext(ctx, requestedModel) {
+		return true
+	}
+	return a.isAntigravityCreditsOveragesActiveWithContext(ctx, requestedModel)
+}
+
+func resolveCreditsOveragesActiveDuration(waitDuration time.Duration) time.Duration {
+	if override, ok := antigravityFallbackCooldownSeconds(); ok {
+		return override
+	}
+	if waitDuration >= creditsOveragesMinimumCooldown {
+		return waitDuration
+	}
+	if waitDuration > 0 {
+		return creditsOveragesMinimumCooldown
+	}
+	return creditsOveragesDefaultCooldown
+}
+
 // isCreditsExhausted 检查账号的 AICredits 限流 key 是否生效（积分是否耗尽）。
 func (a *Account) isCreditsExhausted() bool {
 	if a == nil {
 		return false
 	}
-	return a.isRateLimitActiveForKey(creditsExhaustedKey)
+	return a.isRateLimitActiveForKey(creditsExhaustedKey) ||
+		a.isRateLimitActiveForKey(creditsRequestInsufficientKey)
 }
 
 // setCreditsExhausted 标记账号积分耗尽：写入 model_rate_limits["AICredits"] + 更新缓存。
@@ -87,7 +202,7 @@ func (s *AntigravityGatewayService) setCreditsExhausted(ctx context.Context, acc
 
 // clearCreditsExhausted 清除账号的 AICredits 限流 key。
 func (s *AntigravityGatewayService) clearCreditsExhausted(ctx context.Context, account *Account) {
-	if err := clearCreditsExhaustedState(ctx, s.accountRepo, account); err != nil {
+	if err := clearCreditsSelectionState(ctx, s.accountRepo, account); err != nil {
 		accountID := int64(0)
 		if account != nil {
 			accountID = account.ID
@@ -97,27 +212,48 @@ func (s *AntigravityGatewayService) clearCreditsExhausted(ctx context.Context, a
 }
 
 func clearCreditsExhaustedState(ctx context.Context, repo AccountRepository, account *Account) error {
+	_, err := clearCreditsRateLimitKeys(ctx, repo, account, creditsExhaustedKey)
+	return err
+}
+
+func clearCreditsRequestInsufficientState(ctx context.Context, repo AccountRepository, account *Account) error {
+	_, err := clearCreditsRateLimitKeys(ctx, repo, account, creditsRequestInsufficientKey)
+	return err
+}
+
+func clearCreditsSelectionState(ctx context.Context, repo AccountRepository, account *Account) error {
+	_, err := clearCreditsRateLimitKeys(ctx, repo, account, creditsExhaustedKey, creditsRequestInsufficientKey)
+	return err
+}
+
+func clearCreditsRateLimitKeys(ctx context.Context, repo AccountRepository, account *Account, keys ...string) (bool, error) {
 	if account == nil || account.ID == 0 || account.Extra == nil {
-		return nil
+		return false, nil
 	}
 	rawLimits, ok := account.Extra[modelRateLimitsKey].(map[string]any)
 	if !ok {
-		return nil
+		return false, nil
 	}
-	if _, exists := rawLimits[creditsExhaustedKey]; !exists {
-		return nil
+	deleted := false
+	for _, key := range keys {
+		if _, exists := rawLimits[key]; exists {
+			delete(rawLimits, key)
+			deleted = true
+		}
 	}
-	delete(rawLimits, creditsExhaustedKey)
+	if !deleted {
+		return false, nil
+	}
 	account.Extra[modelRateLimitsKey] = rawLimits
 	if repo == nil {
-		return nil
+		return true, nil
 	}
 	if err := repo.UpdateExtra(ctx, account.ID, map[string]any{
 		modelRateLimitsKey: rawLimits,
 	}); err != nil {
-		return err
+		return false, err
 	}
-	return nil
+	return true, nil
 }
 
 // classifyAntigravity429 将 Antigravity 的 429 响应归类为配额耗尽、限流或未知。
@@ -223,14 +359,72 @@ func hasUsableGoogleOneAICredits(usage *UsageInfo) bool {
 	return ok && credit.Amount > credit.MinimumBalance
 }
 
+func getCreditsRequestInsufficientAmount(account *Account) (float64, bool) {
+	if account == nil || account.Extra == nil {
+		return 0, false
+	}
+	rawLimits, ok := account.Extra[modelRateLimitsKey].(map[string]any)
+	if !ok {
+		return 0, false
+	}
+	rawLimit, ok := rawLimits[creditsRequestInsufficientKey].(map[string]any)
+	if !ok {
+		return 0, false
+	}
+	return parseExtraFloat(rawLimit[creditsAmountField])
+}
+
+func parseExtraFloat(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case int32:
+		return float64(n), true
+	case string:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(n), 64)
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	default:
+		return 0, false
+	}
+}
+
+func shouldClearCreditsRequestInsufficientFromUsage(account *Account, usage *UsageInfo) bool {
+	if !hasUsableGoogleOneAICredits(usage) {
+		return false
+	}
+	current, ok := findGoogleOneAICredit(usage.AICredits)
+	if !ok {
+		return false
+	}
+	lastFailedAmount, ok := getCreditsRequestInsufficientAmount(account)
+	if !ok {
+		return false
+	}
+	return current.Amount > lastFailedAmount
+}
+
 func syncCreditsExhaustedStateFromUsage(ctx context.Context, repo AccountRepository, account *Account, usage *UsageInfo) (bool, error) {
 	if !hasUsableGoogleOneAICredits(usage) {
 		return false, nil
 	}
-	if err := clearCreditsExhaustedState(ctx, repo, account); err != nil {
+	keys := []string{creditsExhaustedKey}
+	if shouldClearCreditsRequestInsufficientFromUsage(account, usage) {
+		keys = append(keys, creditsRequestInsufficientKey)
+	}
+	cleared, err := clearCreditsRateLimitKeys(ctx, repo, account, keys...)
+	if err != nil {
 		return false, err
 	}
-	return true, nil
+	return cleared, nil
 }
 
 func checkCreditsBalance(ctx context.Context, proxyURL, accessToken string) (AICredit, bool, error) {
@@ -246,6 +440,86 @@ func checkCreditsBalance(ctx context.Context, proxyURL, accessToken string) (AIC
 	}
 	credit, found := findGoogleOneAICredit(extractAICreditsFromLoadCodeAssist(loadResp))
 	return credit, found, nil
+}
+
+func (s *AntigravityGatewayService) setCreditsRequestInsufficient(ctx context.Context, account *Account, creditBalance AICredit) {
+	if account == nil || account.ID == 0 {
+		return
+	}
+	now := time.Now().UTC()
+	resetAt := now.Add(creditsRequestInsufficientCooldown)
+
+	if account.Extra == nil {
+		account.Extra = make(map[string]any)
+	}
+	rawLimits, _ := account.Extra[modelRateLimitsKey].(map[string]any)
+	if rawLimits == nil {
+		rawLimits = make(map[string]any)
+	}
+	delete(rawLimits, creditsExhaustedKey)
+	rawLimits[creditsRequestInsufficientKey] = map[string]any{
+		"rate_limited_at":          now.Format(time.RFC3339),
+		"rate_limit_reset_at":      resetAt.Format(time.RFC3339),
+		creditsAmountField:         creditBalance.Amount,
+		creditsMinimumBalanceField: creditBalance.MinimumBalance,
+		creditsReasonField:         creditsRequestInsufficientReason,
+	}
+	account.Extra[modelRateLimitsKey] = rawLimits
+
+	if s.accountRepo != nil {
+		if err := s.accountRepo.UpdateExtra(ctx, account.ID, map[string]any{
+			modelRateLimitsKey: rawLimits,
+		}); err != nil {
+			logger.LegacyPrintf("service.antigravity_gateway", "set credits request insufficient failed: account=%d err=%v", account.ID, err)
+			return
+		}
+	}
+	if s.schedulerSnapshot != nil {
+		if err := s.schedulerSnapshot.UpdateAccountInCache(ctx, account); err != nil {
+			logger.LegacyPrintf("service.antigravity_gateway", "cache update credits request insufficient failed: account=%d err=%v", account.ID, err)
+		}
+	}
+	logger.LegacyPrintf("service.antigravity_gateway", "credits_request_insufficient_marked account=%d reset_at=%s amount=%.4f minimum=%.4f",
+		account.ID, resetAt.Format(time.RFC3339), creditBalance.Amount, creditBalance.MinimumBalance)
+}
+
+func (s *AntigravityGatewayService) setCreditsOveragesActive(ctx context.Context, account *Account, modelKey string, waitDuration time.Duration) {
+	if account == nil || account.ID == 0 {
+		return
+	}
+	extraKey := buildAntigravityCreditsOveragesExtraKey(modelKey)
+	if extraKey == "" {
+		return
+	}
+	now := time.Now().UTC()
+	activeUntil := now.Add(resolveCreditsOveragesActiveDuration(waitDuration))
+	state := map[string]any{
+		creditsActivatedAtField:   now.Format(time.RFC3339),
+		creditsLastSuccessAtField: now.Format(time.RFC3339),
+		creditsActiveUntilField:   activeUntil.Format(time.RFC3339),
+		creditsReasonField:        creditsOveragesActiveReason,
+	}
+
+	if account.Extra == nil {
+		account.Extra = make(map[string]any)
+	}
+	account.Extra[extraKey] = state
+
+	if s.accountRepo != nil {
+		if err := s.accountRepo.UpdateExtra(ctx, account.ID, map[string]any{
+			extraKey: state,
+		}); err != nil {
+			logger.LegacyPrintf("service.antigravity_gateway", "set credits overages active failed: account=%d model=%s err=%v", account.ID, modelKey, err)
+			return
+		}
+	}
+	if s.schedulerSnapshot != nil {
+		if err := s.schedulerSnapshot.UpdateAccountInCache(ctx, account); err != nil {
+			logger.LegacyPrintf("service.antigravity_gateway", "cache update credits overages active failed: account=%d model=%s err=%v", account.ID, modelKey, err)
+		}
+	}
+	logger.LegacyPrintf("service.antigravity_gateway", "credits_overages_active_marked account=%d model=%s active_until=%s",
+		account.ID, modelKey, activeUntil.Format(time.RFC3339))
 }
 
 type creditsOveragesRetryResult struct {
@@ -280,6 +554,10 @@ func (s *AntigravityGatewayService) attemptCreditsOveragesRetry(
 	creditsResp, err := p.httpUpstream.Do(creditsReq, p.proxyURL, p.account.ID, p.account.Concurrency)
 	if err == nil && creditsResp != nil && creditsResp.StatusCode < 400 {
 		s.clearCreditsExhausted(p.ctx, p.account)
+		s.setCreditsOveragesActive(p.ctx, p.account, modelKey, waitDuration)
+		if s.cache != nil && p.sessionHash != "" {
+			_ = s.cache.DeleteSessionAccountID(p.ctx, p.groupID, p.sessionHash)
+		}
 		logger.LegacyPrintf("service.antigravity_gateway", "%s status=%d credit_overages_success model=%s account=%d",
 			p.prefix, creditsResp.StatusCode, modelKey, p.account.ID)
 		return &creditsOveragesRetryResult{handled: true, resp: creditsResp}
@@ -317,12 +595,8 @@ func (s *AntigravityGatewayService) handleCreditsRetryFailure(
 			return
 		}
 		if hasCreditsBalance && creditBalance.Amount > creditBalance.MinimumBalance {
-			if err := clearCreditsExhaustedState(ctx, s.accountRepo, account); err != nil {
-				logger.LegacyPrintf("service.antigravity_gateway", "%s credit_overages_failed model=%s account=%d marked_exhausted=false status=%d confirm_balance_clear_err=%v amount=%.4f minimum=%.4f body=%s",
-					prefix, modelKey, account.ID, creditsStatusCode, err, creditBalance.Amount, creditBalance.MinimumBalance, truncateForLog(creditsRespBody, 200))
-				return
-			}
-			logger.LegacyPrintf("service.antigravity_gateway", "%s credit_overages_failed model=%s account=%d marked_exhausted=false status=%d confirmed_credits_available=true amount=%.4f minimum=%.4f body=%s",
+			s.setCreditsRequestInsufficient(ctx, account, creditBalance)
+			logger.LegacyPrintf("service.antigravity_gateway", "%s credit_overages_failed model=%s account=%d marked_request_insufficient=true status=%d confirmed_credits_available=true amount=%.4f minimum=%.4f body=%s",
 				prefix, modelKey, account.ID, creditsStatusCode, creditBalance.Amount, creditBalance.MinimumBalance, truncateForLog(creditsRespBody, 200))
 			return
 		}

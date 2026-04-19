@@ -37,6 +37,9 @@ func TestUpdateAccount_DisableOveragesClearsAICreditsKey(t *testing.T) {
 			Extra: map[string]any{
 				"allow_overages":   true,
 				"mixed_scheduling": true,
+				buildAntigravityCreditsOveragesExtraKey("claude-sonnet-4-5"): map[string]any{
+					creditsActiveUntilField: time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+				},
 				modelRateLimitsKey: map[string]any{
 					"claude-sonnet-4-5": map[string]any{
 						"rate_limited_at":     "2026-03-15T00:00:00Z",
@@ -55,6 +58,9 @@ func TestUpdateAccount_DisableOveragesClearsAICreditsKey(t *testing.T) {
 	updated, err := svc.UpdateAccount(context.Background(), accountID, &UpdateAccountInput{
 		Extra: map[string]any{
 			"mixed_scheduling": true,
+			buildAntigravityCreditsOveragesExtraKey("claude-sonnet-4-5"): map[string]any{
+				creditsActiveUntilField: time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+			},
 			modelRateLimitsKey: map[string]any{
 				"claude-sonnet-4-5": map[string]any{
 					"rate_limited_at":     "2026-03-15T00:00:00Z",
@@ -79,6 +85,7 @@ func TestUpdateAccount_DisableOveragesClearsAICreditsKey(t *testing.T) {
 		_, exists := rawLimits[creditsExhaustedKey]
 		require.False(t, exists, "关闭 overages 时应清除 AICredits 限流 key")
 	}
+	require.NotContains(t, repo.account.Extra, buildAntigravityCreditsOveragesExtraKey("claude-sonnet-4-5"))
 	// 普通模型限流应保留
 	require.True(t, ok)
 	_, exists := rawLimits["claude-sonnet-4-5"]
@@ -95,6 +102,9 @@ func TestUpdateAccount_EnableOveragesClearsModelRateLimitsBeforePersist(t *testi
 			Status:   StatusActive,
 			Extra: map[string]any{
 				"mixed_scheduling": true,
+				buildAntigravityCreditsOveragesExtraKey("claude-sonnet-4-5"): map[string]any{
+					creditsActiveUntilField: time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+				},
 				modelRateLimitsKey: map[string]any{
 					"claude-sonnet-4-5": map[string]any{
 						"rate_limited_at":     "2026-03-15T00:00:00Z",
@@ -120,6 +130,7 @@ func TestUpdateAccount_EnableOveragesClearsModelRateLimitsBeforePersist(t *testi
 
 	_, exists := repo.account.Extra[modelRateLimitsKey]
 	require.False(t, exists, "开启 overages 时应在持久化前清掉旧模型限流")
+	require.NotContains(t, repo.account.Extra, buildAntigravityCreditsOveragesExtraKey("claude-sonnet-4-5"))
 }
 
 func TestUpdateAccount_EmptyExtraPayloadCanClearQuotaLimits(t *testing.T) {

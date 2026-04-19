@@ -85,6 +85,46 @@ func TestIsCreditsExhausted_UsesAICreditsKey(t *testing.T) {
 		}
 		require.False(t, account.isCreditsExhausted())
 	})
+
+	t.Run("请求级 credits 不足冷却生效时也视为不可用", func(t *testing.T) {
+		account := &Account{
+			ID:       4,
+			Platform: PlatformAntigravity,
+			Extra: map[string]any{
+				"allow_overages": true,
+				modelRateLimitsKey: map[string]any{
+					creditsRequestInsufficientKey: map[string]any{
+						"rate_limited_at":          time.Now().UTC().Format(time.RFC3339),
+						"rate_limit_reset_at":      time.Now().Add(creditsRequestInsufficientCooldown).UTC().Format(time.RFC3339),
+						creditsAmountField:         6.0,
+						creditsMinimumBalanceField: 5.0,
+						creditsReasonField:         creditsRequestInsufficientReason,
+					},
+				},
+			},
+		}
+		require.True(t, account.isCreditsExhausted())
+	})
+
+	t.Run("请求级 credits 不足冷却过期后恢复可用", func(t *testing.T) {
+		account := &Account{
+			ID:       5,
+			Platform: PlatformAntigravity,
+			Extra: map[string]any{
+				"allow_overages": true,
+				modelRateLimitsKey: map[string]any{
+					creditsRequestInsufficientKey: map[string]any{
+						"rate_limited_at":          time.Now().Add(-creditsRequestInsufficientCooldown).UTC().Format(time.RFC3339),
+						"rate_limit_reset_at":      time.Now().Add(-time.Minute).UTC().Format(time.RFC3339),
+						creditsAmountField:         6.0,
+						creditsMinimumBalanceField: 5.0,
+						creditsReasonField:         creditsRequestInsufficientReason,
+					},
+				},
+			},
+		}
+		require.False(t, account.isCreditsExhausted())
+	})
 }
 
 func TestHandleSmartRetry_QuotaExhausted_UsesCreditsAndStoresIndependentState(t *testing.T) {
@@ -98,6 +138,7 @@ func TestHandleSmartRetry_QuotaExhausted_UsesCreditsAndStoresIndependentState(t 
 		errors:    []error{nil},
 	}
 	repo := &stubAntigravityAccountRepo{}
+	cache := &stubSmartRetryCache{}
 	account := &Account{
 		ID:       101,
 		Name:     "acc-101",
@@ -129,12 +170,14 @@ func TestHandleSmartRetry_QuotaExhausted_UsesCreditsAndStoresIndependentState(t 
 		httpUpstream:   upstream,
 		accountRepo:    repo,
 		requestedModel: "claude-opus-4-6",
+		groupID:        9,
+		sessionHash:    "sticky-overages-success",
 		handleError: func(ctx context.Context, prefix string, account *Account, statusCode int, headers http.Header, body []byte, requestedModel string, groupID int64, sessionHash string, isStickySession bool) *handleModelRateLimitResult {
 			return nil
 		},
 	}
 
-	svc := &AntigravityGatewayService{}
+	svc := &AntigravityGatewayService{accountRepo: repo, cache: cache}
 	result := svc.handleSmartRetry(params, resp, respBody, "https://ag-1.test", 0, []string{"https://ag-1.test"})
 
 	require.NotNil(t, result)
@@ -144,6 +187,14 @@ func TestHandleSmartRetry_QuotaExhausted_UsesCreditsAndStoresIndependentState(t 
 	require.Len(t, upstream.requestBodies, 1)
 	require.Contains(t, string(upstream.requestBodies[0]), "enabledCreditTypes")
 	require.Empty(t, repo.modelRateLimitCalls, "overages 成功后不应写入普通 model_rate_limits")
+	require.Len(t, repo.extraUpdateCalls, 1)
+	modelKey := buildAntigravityCreditsOveragesExtraKey("claude-sonnet-4-5")
+	state, ok := account.Extra[modelKey].(map[string]any)
+	require.True(t, ok, "overages 成功后应写入独立运行态")
+	require.NotEmpty(t, state[creditsActiveUntilField])
+	require.Len(t, cache.deleteCalls, 1, "overages 成功后应清理当前 sticky 绑定")
+	require.Equal(t, int64(9), cache.deleteCalls[0].groupID)
+	require.Equal(t, "sticky-overages-success", cache.deleteCalls[0].sessionHash)
 }
 
 func TestHandleSmartRetry_RateLimited_DoesNotUseCredits(t *testing.T) {
@@ -243,6 +294,66 @@ func TestAntigravityRetryLoop_ModelRateLimited_InjectsCredits(t *testing.T) {
 					"rate_limited_at":     time.Now().UTC().Format(time.RFC3339),
 					"rate_limit_reset_at": time.Now().Add(30 * time.Minute).UTC().Format(time.RFC3339),
 				},
+			},
+		},
+	}
+
+	svc := &AntigravityGatewayService{}
+	result, err := svc.antigravityRetryLoop(antigravityRetryLoopParams{
+		ctx:            context.Background(),
+		prefix:         "[test]",
+		account:        account,
+		accessToken:    "token",
+		action:         "generateContent",
+		body:           []byte(`{"model":"claude-sonnet-4-5","request":{}}`),
+		httpUpstream:   upstream,
+		requestedModel: "claude-sonnet-4-5",
+		handleError: func(ctx context.Context, prefix string, account *Account, statusCode int, headers http.Header, body []byte, requestedModel string, groupID int64, sessionHash string, isStickySession bool) *handleModelRateLimitResult {
+			return nil
+		},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Len(t, upstream.requestBodies, 1)
+	require.Contains(t, string(upstream.requestBodies[0]), "enabledCreditTypes")
+}
+
+func TestAntigravityRetryLoop_CreditsOveragesActive_InjectsCredits(t *testing.T) {
+	oldBaseURLs := append([]string(nil), antigravity.BaseURLs...)
+	oldAvailability := antigravity.DefaultURLAvailability
+	defer func() {
+		antigravity.BaseURLs = oldBaseURLs
+		antigravity.DefaultURLAvailability = oldAvailability
+	}()
+
+	antigravity.BaseURLs = []string{"https://ag-1.test"}
+	antigravity.DefaultURLAvailability = antigravity.NewURLAvailability(time.Minute)
+
+	upstream := &queuedHTTPUpstreamStub{
+		responses: []*http.Response{
+			{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{},
+				Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+			},
+		},
+		errors: []error{nil},
+	}
+	account := &Account{
+		ID:          1031,
+		Name:        "acc-1031",
+		Type:        AccountTypeOAuth,
+		Platform:    PlatformAntigravity,
+		Status:      StatusActive,
+		Schedulable: true,
+		Extra: map[string]any{
+			"allow_overages": true,
+			buildAntigravityCreditsOveragesExtraKey("claude-sonnet-4-5"): map[string]any{
+				creditsActivatedAtField:   time.Now().UTC().Format(time.RFC3339),
+				creditsLastSuccessAtField: time.Now().UTC().Format(time.RFC3339),
+				creditsActiveUntilField:   time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+				creditsReasonField:        creditsOveragesActiveReason,
 			},
 		},
 	}
@@ -602,8 +713,11 @@ func TestHandleCreditsRetryFailure_ConfirmsBalanceBeforeMarking(t *testing.T) {
 		require.Empty(t, repo.modelRateLimitCalls)
 		require.Len(t, repo.extraUpdateCalls, 1)
 		rawLimits := account.Extra[modelRateLimitsKey].(map[string]any)
-		_, exists := rawLimits[creditsExhaustedKey]
-		require.False(t, exists)
+		_, exhaustedExists := rawLimits[creditsExhaustedKey]
+		require.False(t, exhaustedExists)
+		requestCooldown, exists := rawLimits[creditsRequestInsufficientKey].(map[string]any)
+		require.True(t, exists)
+		require.Equal(t, 12.0, requestCooldown[creditsAmountField])
 	})
 
 	t.Run("确认 credits 不可用时才标记", func(t *testing.T) {
@@ -669,6 +783,41 @@ func TestSyncCreditsExhaustedStateFromUsage(t *testing.T) {
 		require.False(t, exists)
 	})
 
+	t.Run("余额明显上涨时提前清理请求级 credits 不足冷却", func(t *testing.T) {
+		repo := &stubAntigravityAccountRepo{}
+		account := &Account{
+			ID: 3,
+			Extra: map[string]any{
+				modelRateLimitsKey: map[string]any{
+					creditsRequestInsufficientKey: map[string]any{
+						"rate_limited_at":          time.Now().UTC().Format(time.RFC3339),
+						"rate_limit_reset_at":      time.Now().Add(creditsRequestInsufficientCooldown).UTC().Format(time.RFC3339),
+						creditsAmountField:         6.0,
+						creditsMinimumBalanceField: 5.0,
+						creditsReasonField:         creditsRequestInsufficientReason,
+					},
+				},
+			},
+		}
+		usage := &UsageInfo{
+			AICredits: []AICredit{
+				{
+					CreditType:     googleOneAICreditType,
+					Amount:         20,
+					MinimumBalance: 5,
+				},
+			},
+		}
+
+		cleared, err := syncCreditsExhaustedStateFromUsage(context.Background(), repo, account, usage)
+		require.NoError(t, err)
+		require.True(t, cleared)
+		require.Len(t, repo.extraUpdateCalls, 1)
+		rawLimits := account.Extra[modelRateLimitsKey].(map[string]any)
+		_, exists := rawLimits[creditsRequestInsufficientKey]
+		require.False(t, exists)
+	})
+
 	t.Run("usage 未明确恢复时不清理", func(t *testing.T) {
 		repo := &stubAntigravityAccountRepo{}
 		account := &Account{
@@ -700,4 +849,124 @@ func TestSyncCreditsExhaustedStateFromUsage(t *testing.T) {
 		_, exists := rawLimits[creditsExhaustedKey]
 		require.True(t, exists)
 	})
+
+	t.Run("余额未超过上次失败值时保留请求级 credits 不足冷却", func(t *testing.T) {
+		repo := &stubAntigravityAccountRepo{}
+		account := &Account{
+			ID: 4,
+			Extra: map[string]any{
+				modelRateLimitsKey: map[string]any{
+					creditsRequestInsufficientKey: map[string]any{
+						"rate_limited_at":          time.Now().UTC().Format(time.RFC3339),
+						"rate_limit_reset_at":      time.Now().Add(creditsRequestInsufficientCooldown).UTC().Format(time.RFC3339),
+						creditsAmountField:         6.0,
+						creditsMinimumBalanceField: 5.0,
+						creditsReasonField:         creditsRequestInsufficientReason,
+					},
+				},
+			},
+		}
+		usage := &UsageInfo{
+			AICredits: []AICredit{
+				{
+					CreditType:     googleOneAICreditType,
+					Amount:         6,
+					MinimumBalance: 5,
+				},
+			},
+		}
+
+		cleared, err := syncCreditsExhaustedStateFromUsage(context.Background(), repo, account, usage)
+		require.NoError(t, err)
+		require.False(t, cleared)
+		require.Empty(t, repo.extraUpdateCalls)
+		rawLimits := account.Extra[modelRateLimitsKey].(map[string]any)
+		_, exists := rawLimits[creditsRequestInsufficientKey]
+		require.True(t, exists)
+	})
+}
+
+func TestAntigravityModelSelectionMode_RequestInsufficientCooldownDisablesCreditsFallback(t *testing.T) {
+	now := time.Now()
+	account := &Account{
+		ID:          88,
+		Platform:    PlatformAntigravity,
+		Status:      StatusActive,
+		Schedulable: true,
+		Extra: map[string]any{
+			"allow_overages": true,
+			modelRateLimitsKey: map[string]any{
+				"claude-sonnet-4-6": map[string]any{
+					"rate_limited_at":     now.UTC().Format(time.RFC3339),
+					"rate_limit_reset_at": now.Add(30 * time.Minute).UTC().Format(time.RFC3339),
+				},
+				creditsRequestInsufficientKey: map[string]any{
+					"rate_limited_at":          now.UTC().Format(time.RFC3339),
+					"rate_limit_reset_at":      now.Add(creditsRequestInsufficientCooldown).UTC().Format(time.RFC3339),
+					creditsAmountField:         6.0,
+					creditsMinimumBalanceField: 5.0,
+					creditsReasonField:         creditsRequestInsufficientReason,
+				},
+			},
+		},
+	}
+
+	svc := &GatewayService{}
+	mode := svc.antigravityModelSelectionMode(context.Background(), account, "claude-sonnet-4-6")
+	require.Equal(t, antigravityModelSelectionUnavailable, mode)
+}
+
+func TestAntigravityModelSelectionMode_CreditsOveragesActiveUsesFallback(t *testing.T) {
+	account := &Account{
+		ID:          89,
+		Platform:    PlatformAntigravity,
+		Status:      StatusActive,
+		Schedulable: true,
+		Extra: map[string]any{
+			"allow_overages": true,
+			buildAntigravityCreditsOveragesExtraKey("claude-sonnet-4-6"): map[string]any{
+				creditsActivatedAtField:   time.Now().UTC().Format(time.RFC3339),
+				creditsLastSuccessAtField: time.Now().UTC().Format(time.RFC3339),
+				creditsActiveUntilField:   time.Now().Add(30 * time.Minute).UTC().Format(time.RFC3339),
+				creditsReasonField:        creditsOveragesActiveReason,
+			},
+		},
+	}
+
+	svc := &GatewayService{}
+	mode := svc.antigravityModelSelectionMode(context.Background(), account, "claude-sonnet-4-6")
+	require.Equal(t, antigravityModelSelectionCreditsFallback, mode)
+}
+
+func TestPreferDirectAntigravityAccounts_PrefersDirectOverOveragesActive(t *testing.T) {
+	now := time.Now().UTC()
+	direct := &Account{
+		ID:          201,
+		Platform:    PlatformAntigravity,
+		Status:      StatusActive,
+		Schedulable: true,
+		Extra: map[string]any{
+			"allow_overages": true,
+		},
+	}
+	fallback := &Account{
+		ID:          202,
+		Platform:    PlatformAntigravity,
+		Status:      StatusActive,
+		Schedulable: true,
+		Extra: map[string]any{
+			"allow_overages": true,
+			buildAntigravityCreditsOveragesExtraKey("claude-sonnet-4-6"): map[string]any{
+				creditsActivatedAtField:   now.Format(time.RFC3339),
+				creditsLastSuccessAtField: now.Format(time.RFC3339),
+				creditsActiveUntilField:   now.Add(30 * time.Minute).Format(time.RFC3339),
+				creditsReasonField:        creditsOveragesActiveReason,
+			},
+		},
+	}
+
+	svc := &GatewayService{}
+	filtered := svc.preferDirectAntigravityAccounts(context.Background(), []*Account{fallback, direct}, "claude-sonnet-4-6")
+	require.Len(t, filtered, 1)
+	require.Equal(t, int64(201), filtered[0].ID)
 }

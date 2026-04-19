@@ -101,6 +101,36 @@ func TestShouldClearStickySession(t *testing.T) {
 			requestedModel: "claude-opus-4", // 请求不同模型
 			want:           false,           // 不同模型不受影响
 		},
+		{
+			name: "antigravity credits overages active",
+			account: &Account{
+				Platform:    PlatformAntigravity,
+				Status:      StatusActive,
+				Schedulable: true,
+				Extra: map[string]any{
+					buildAntigravityCreditsOveragesExtraKey("claude-sonnet-4"): map[string]any{
+						creditsActiveUntilField: time.Now().Add(30 * time.Minute).UTC().Format(time.RFC3339),
+					},
+				},
+			},
+			requestedModel: "claude-sonnet-4",
+			want:           true,
+		},
+		{
+			name: "antigravity credits overages active different model",
+			account: &Account{
+				Platform:    PlatformAntigravity,
+				Status:      StatusActive,
+				Schedulable: true,
+				Extra: map[string]any{
+					buildAntigravityCreditsOveragesExtraKey("claude-sonnet-4"): map[string]any{
+						creditsActiveUntilField: time.Now().Add(30 * time.Minute).UTC().Format(time.RFC3339),
+					},
+				},
+			},
+			requestedModel: "claude-opus-4",
+			want:           false,
+		},
 	}
 
 	for _, tt := range tests {
