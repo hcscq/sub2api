@@ -222,6 +222,41 @@ func TestBuildAntigravitySelectionTraceCandidates(t *testing.T) {
 	}
 }
 
+func TestFilterByMinAntigravityRuntimePenalty_PrefersRecentHealthyAccount(t *testing.T) {
+	svc := &GatewayService{}
+	ctx := context.WithValue(context.Background(), antigravityRecentStatsPrefetchContextKey, map[int64]*RecentSuccessStats{
+		101: {
+			RecentSuccessCount: 1,
+			RecentRequestCount: 10,
+		},
+		202: {
+			RecentSuccessCount: 9,
+			RecentRequestCount: 10,
+		},
+	})
+
+	filtered := svc.filterByMinAntigravityRuntimePenalty(ctx, []accountWithLoad{
+		{
+			account: &Account{
+				ID:       101,
+				Platform: PlatformAntigravity,
+			},
+		},
+		{
+			account: &Account{
+				ID:       202,
+				Platform: PlatformAntigravity,
+			},
+		},
+	})
+
+	if len(filtered) != 1 {
+		t.Fatalf("len(filtered)=%d want=1", len(filtered))
+	}
+	if filtered[0].account == nil || filtered[0].account.ID != 202 {
+		t.Fatalf("selected account=%v want=202", filtered[0].account)
+	}
+}
 func TestAnnotateAntigravitySelectionTraceCandidates(t *testing.T) {
 	items := []antigravitySelectionCandidateTrace{
 		{AccountID: 397, Mode: "direct", Status: "eligible"},

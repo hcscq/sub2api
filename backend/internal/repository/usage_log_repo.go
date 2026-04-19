@@ -2076,8 +2076,10 @@ func (r *usageLogRepository) GetAccountWindowStatsBatch(ctx context.Context, acc
 	return result, nil
 }
 
-// GetAccountRecentSuccessStatsBatch 批量获取账号最近成功情况。
-// recent_success_count 统计 since 之后的成功次数；last_success_at 为最近一次成功时间。
+// GetAccountRecentSuccessStatsBatch 批量获取账号最近请求情况。
+// recent_success_count 统计 since 之后的成功次数；
+// recent_request_count 统计 since 之后的总调用次数（成功 + 最终失败）；
+// last_success_at 为最近一次成功时间。
 func (r *usageLogRepository) GetAccountRecentSuccessStatsBatch(ctx context.Context, accountIDs []int64, since time.Time) (map[int64]*service.RecentSuccessStats, error) {
 	result := make(map[int64]*service.RecentSuccessStats, len(accountIDs))
 	if len(accountIDs) == 0 {
@@ -2085,14 +2087,37 @@ func (r *usageLogRepository) GetAccountRecentSuccessStatsBatch(ctx context.Conte
 	}
 
 	query := `
-		SELECT
-			account_id,
-			COUNT(*) FILTER (WHERE created_at >= $2) AS recent_success_count,
-			MAX(created_at) AS last_success_at
-		FROM usage_logs
-		WHERE account_id = ANY($1)
-		GROUP BY account_id
-	`
+			WITH target_accounts AS (
+				SELECT UNNEST($1::bigint[]) AS account_id
+			),
+			success_recent AS (
+				SELECT account_id, COUNT(*) AS recent_success_count
+				FROM usage_logs
+				WHERE account_id = ANY($1) AND created_at >= $2
+				GROUP BY account_id
+			),
+			last_success AS (
+				SELECT DISTINCT ON (account_id) account_id, created_at AS last_success_at
+				FROM usage_logs
+				WHERE account_id = ANY($1)
+				ORDER BY account_id, created_at DESC
+			),
+			failure_recent AS (
+				SELECT account_id, COUNT(*) AS recent_failure_count
+				FROM ops_error_logs
+				WHERE account_id = ANY($1) AND created_at >= $2 AND status_code >= 400
+				GROUP BY account_id
+			)
+			SELECT
+				t.account_id,
+				COALESCE(s.recent_success_count, 0) AS recent_success_count,
+				COALESCE(s.recent_success_count, 0) + COALESCE(f.recent_failure_count, 0) AS recent_request_count,
+				l.last_success_at
+			FROM target_accounts t
+			LEFT JOIN success_recent s ON s.account_id = t.account_id
+			LEFT JOIN failure_recent f ON f.account_id = t.account_id
+			LEFT JOIN last_success l ON l.account_id = t.account_id
+		`
 	rows, err := r.sql.QueryContext(ctx, query, pq.Array(accountIDs), since)
 	if err != nil {
 		return nil, err
@@ -2103,9 +2128,13 @@ func (r *usageLogRepository) GetAccountRecentSuccessStatsBatch(ctx context.Conte
 		var accountID int64
 		var stats service.RecentSuccessStats
 		var lastSuccessAt sql.NullTime
-		if err := rows.Scan(&accountID, &stats.RecentSuccessCount, &lastSuccessAt); err != nil {
+		var recentSuccessCount int64
+		var recentRequestCount int64
+		if err := rows.Scan(&accountID, &recentSuccessCount, &recentRequestCount, &lastSuccessAt); err != nil {
 			return nil, err
 		}
+		stats.RecentSuccessCount = int(recentSuccessCount)
+		stats.RecentRequestCount = int(recentRequestCount)
 		if lastSuccessAt.Valid {
 			t := lastSuccessAt.Time
 			stats.LastSuccessAt = &t

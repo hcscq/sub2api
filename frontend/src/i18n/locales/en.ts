@@ -2146,7 +2146,7 @@ export default {
         weight: 'Weight',
         status: 'Status',
         schedulable: 'Schedulable',
-        recentSuccess: 'Recent Success',
+        recentSuccess: '15m Calls',
         todayStats: 'Today Stats',
         groups: 'Groups',
         usageWindows: 'Usage Windows',
@@ -2157,6 +2157,8 @@ export default {
       },
       recentSuccess: {
         windowLabel: 'Last {minutes}m',
+        summaryLabel: 'Total {total} / OK {success}',
+        rateLabel: 'Success rate',
         lastLabel: 'Last success'
       },
       allPrivacyModes: 'All Privacy States',

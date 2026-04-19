@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 本地构建镜像的快速脚本，避免在命令行反复输入构建参数。
+# 仅供手动本地调试构建使用；正式发版统一走 GitHub Actions，勿将此脚本用于例行发布。
 
 set -euo pipefail
 

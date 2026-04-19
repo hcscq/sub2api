@@ -53,10 +53,12 @@ const (
 	claudeCodeSystemPrompt = "You are Claude Code, Anthropic's official CLI for Claude."
 	maxCacheControlBlocks  = 4 // Anthropic API 允许的最大 cache_control 块数量
 
-	defaultUserGroupRateCacheTTL = 30 * time.Second
-	defaultModelsListCacheTTL    = 15 * time.Second
-	postUsageBillingTimeout      = 15 * time.Second
-	debugGatewayBodyEnv          = "SUB2API_DEBUG_GATEWAY_BODY"
+	defaultUserGroupRateCacheTTL  = 30 * time.Second
+	defaultModelsListCacheTTL     = 15 * time.Second
+	antigravityRecentStatsWindow  = 15 * time.Minute
+	antigravityRecentStatsCacheTTL = 15 * time.Second
+	postUsageBillingTimeout       = 15 * time.Second
+	debugGatewayBodyEnv           = "SUB2API_DEBUG_GATEWAY_BODY"
 )
 
 const (
@@ -677,8 +679,9 @@ type GatewayService struct {
 	resolver              *ModelPricingResolver
 	debugGatewayBodyFile  atomic.Pointer[os.File] // non-nil when SUB2API_DEBUG_GATEWAY_BODY is set
 	tlsFPProfileService   *TLSFingerprintProfileService
-	balanceNotifyService  *BalanceNotifyService
-	antigravityRuntime    *antigravityAccountRuntimeStats
+	balanceNotifyService       *BalanceNotifyService
+	antigravityRuntime         *antigravityAccountRuntimeStats
+	antigravityRecentStatsCache *gocache.Cache
 }
 
 // NewGatewayService creates a new GatewayService
@@ -739,12 +742,13 @@ func NewGatewayService(
 		settingService:       settingService,
 		modelsListCache:      gocache.New(modelsListTTL, time.Minute),
 		modelsListCacheTTL:   modelsListTTL,
-		responseHeaderFilter: compileResponseHeaderFilter(cfg),
-		tlsFPProfileService:  tlsFPProfileService,
-		channelService:       channelService,
-		resolver:             resolver,
-		balanceNotifyService: balanceNotifyService,
-		antigravityRuntime:   newAntigravityAccountRuntimeStats(),
+		responseHeaderFilter:  compileResponseHeaderFilter(cfg),
+		tlsFPProfileService:   tlsFPProfileService,
+		channelService:        channelService,
+		resolver:              resolver,
+		balanceNotifyService:  balanceNotifyService,
+		antigravityRuntime:    newAntigravityAccountRuntimeStats(),
+		antigravityRecentStatsCache: gocache.New(antigravityRecentStatsCacheTTL, time.Minute),
 	}
 	svc.userGroupRateResolver = newUserGroupRateResolver(
 		userGroupRateRepo,
@@ -1463,6 +1467,7 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 	}
 	ctx = s.withWindowCostPrefetch(ctx, accounts)
 	ctx = s.withRPMPrefetch(ctx, accounts)
+	ctx = s.withAntigravityRecentStatsPrefetch(ctx, accounts)
 	var antigravityTraceCandidates []antigravitySelectionCandidateTrace
 	if platform == PlatformAntigravity {
 		antigravityTraceCandidates = s.buildAntigravitySelectionTraceCandidates(ctx, accounts, requestedModel, excludedIDs)
@@ -2076,7 +2081,7 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 			}
 			// 3. Antigravity 先排除近期失败/慢首字的账号，再看负载
 			if platform == PlatformAntigravity {
-				candidates = s.filterByMinAntigravityRuntimePenalty(candidates)
+				candidates = s.filterByMinAntigravityRuntimePenalty(ctx, candidates)
 				traceRound.MinRuntimePenaltyIDs = extractAccountLoadIDs(candidates)
 			}
 			// 4. Antigravity 在同运行态层里优先复用已有成功记录的 warm 账号，
@@ -2769,22 +2774,69 @@ func (s *GatewayService) ReportAntigravityResult(accountID int64, success bool, 
 	s.antigravityRuntime.report(accountID, success, firstTokenMs)
 }
 
-func (s *GatewayService) antigravityRuntimePenaltyMilli(accountID int64) int {
-	if s == nil || s.antigravityRuntime == nil || accountID <= 0 {
+func antigravityRecentRequestPenaltyMilli(stats *RecentSuccessStats) int {
+	if stats == nil || stats.RecentRequestCount < 3 {
 		return 0
 	}
-	errorRate, hasErrorRate, ttft, hasTTFT := s.antigravityRuntime.snapshot(accountID)
-	penalty := 0.0
-	if hasErrorRate {
-		penalty += errorRate * 3.0
-	}
-	if hasTTFT {
-		penalty += clamp01(ttft / 12000.0)
-	}
-	return int(math.Round(penalty * 1000))
+	requestCount := float64(stats.RecentRequestCount)
+	successRate := clamp01(float64(stats.RecentSuccessCount) / requestCount)
+	failureRate := 1 - successRate
+	confidence := clamp01((requestCount - 1) / 8.0)
+	return int(math.Round(failureRate * confidence * 2500))
 }
 
-func (s *GatewayService) filterByMinAntigravityRuntimePenalty(accounts []accountWithLoad) []accountWithLoad {
+func antigravityRecentStatsFromPrefetchContext(ctx context.Context, accountID int64) (*RecentSuccessStats, bool) {
+	if ctx == nil || accountID <= 0 {
+		return nil, false
+	}
+	statsByAccount, ok := ctx.Value(antigravityRecentStatsPrefetchContextKey).(map[int64]*RecentSuccessStats)
+	if !ok || len(statsByAccount) == 0 {
+		return nil, false
+	}
+	stats, exists := statsByAccount[accountID]
+	if !exists || stats == nil {
+		return nil, false
+	}
+	return stats, true
+}
+
+func cloneRecentSuccessStats(stats *RecentSuccessStats) *RecentSuccessStats {
+	if stats == nil {
+		return nil
+	}
+	cloned := *stats
+	if stats.LastSuccessAt != nil {
+		t := *stats.LastSuccessAt
+		cloned.LastSuccessAt = &t
+	}
+	return &cloned
+}
+
+func antigravityRecentStatsCacheKey(accountID int64) string {
+	return strconv.FormatInt(accountID, 10)
+}
+
+func (s *GatewayService) antigravityRuntimePenaltyMilli(ctx context.Context, accountID int64) int {
+	if s == nil || accountID <= 0 {
+		return 0
+	}
+	penaltyMilli := 0
+	if s.antigravityRuntime != nil {
+		errorRate, hasErrorRate, ttft, hasTTFT := s.antigravityRuntime.snapshot(accountID)
+		if hasErrorRate {
+			penaltyMilli += int(math.Round(errorRate * 3000))
+		}
+		if hasTTFT {
+			penaltyMilli += int(math.Round(clamp01(ttft/12000.0) * 1000))
+		}
+	}
+	if stats, ok := antigravityRecentStatsFromPrefetchContext(ctx, accountID); ok {
+		penaltyMilli += antigravityRecentRequestPenaltyMilli(stats)
+	}
+	return penaltyMilli
+}
+
+func (s *GatewayService) filterByMinAntigravityRuntimePenalty(ctx context.Context, accounts []accountWithLoad) []accountWithLoad {
 	if len(accounts) == 0 {
 		return accounts
 	}
@@ -2794,7 +2846,7 @@ func (s *GatewayService) filterByMinAntigravityRuntimePenalty(accounts []account
 		if acc.account == nil || acc.account.Platform != PlatformAntigravity {
 			continue
 		}
-		penalty := s.antigravityRuntimePenaltyMilli(acc.account.ID)
+		penalty := s.antigravityRuntimePenaltyMilli(ctx, acc.account.ID)
 		if !hasAntigravity || penalty < minPenalty {
 			minPenalty = penalty
 			hasAntigravity = true
@@ -2808,7 +2860,7 @@ func (s *GatewayService) filterByMinAntigravityRuntimePenalty(accounts []account
 		if acc.account == nil || acc.account.Platform != PlatformAntigravity {
 			continue
 		}
-		if s.antigravityRuntimePenaltyMilli(acc.account.ID) == minPenalty {
+		if s.antigravityRuntimePenaltyMilli(ctx, acc.account.ID) == minPenalty {
 			result = append(result, acc)
 		}
 	}
@@ -2818,15 +2870,15 @@ func (s *GatewayService) filterByMinAntigravityRuntimePenalty(accounts []account
 	return result
 }
 
-func (s *GatewayService) antigravityRuntimeBetter(left, right *Account) (bool, bool) {
+func (s *GatewayService) antigravityRuntimeBetter(ctx context.Context, left, right *Account) (bool, bool) {
 	if s == nil || left == nil || right == nil {
 		return false, false
 	}
 	if left.Platform != PlatformAntigravity || right.Platform != PlatformAntigravity {
 		return false, false
 	}
-	leftPenalty := s.antigravityRuntimePenaltyMilli(left.ID)
-	rightPenalty := s.antigravityRuntimePenaltyMilli(right.ID)
+	leftPenalty := s.antigravityRuntimePenaltyMilli(ctx, left.ID)
+	rightPenalty := s.antigravityRuntimePenaltyMilli(ctx, right.ID)
 	if leftPenalty == rightPenalty {
 		return false, false
 	}
@@ -2846,7 +2898,7 @@ func (s *GatewayService) isBetterLegacyCandidate(ctx context.Context, requestedM
 	if better, decided := s.antigravityModelSelectionBetter(ctx, requestedModel, candidate, selected); decided {
 		return better
 	}
-	if better, decided := s.antigravityRuntimeBetter(candidate, selected); decided {
+	if better, decided := s.antigravityRuntimeBetter(ctx, candidate, selected); decided {
 		return better
 	}
 	if better, decided := antigravityWarmLastUsedBetter(candidate, selected); decided {
@@ -2877,7 +2929,7 @@ func (s *GatewayService) lessAntigravityLoadCandidate(ctx context.Context, reque
 	if better, decided := s.antigravityModelSelectionBetter(ctx, requestedModel, left.account, right.account); decided {
 		return better
 	}
-	if better, decided := s.antigravityRuntimeBetter(left.account, right.account); decided {
+	if better, decided := s.antigravityRuntimeBetter(ctx, left.account, right.account); decided {
 		return better
 	}
 	if better, decided := antigravityWarmLastUsedBetter(left.account, right.account); decided {
@@ -2997,7 +3049,7 @@ func (s *GatewayService) lessWaitCandidate(ctx context.Context, requestedModel s
 	if left.loadInfo.CurrentConcurrency != right.loadInfo.CurrentConcurrency {
 		return left.loadInfo.CurrentConcurrency < right.loadInfo.CurrentConcurrency
 	}
-	if better, decided := s.antigravityRuntimeBetter(left.account, right.account); decided {
+	if better, decided := s.antigravityRuntimeBetter(ctx, left.account, right.account); decided {
 		return better
 	}
 	if better, decided := antigravityWarmLastUsedBetter(left.account, right.account); decided {
@@ -3037,8 +3089,10 @@ type usageLogWindowStatsBatchProvider interface {
 	GetAccountWindowStatsBatch(ctx context.Context, accountIDs []int64, startTime time.Time) (map[int64]*usagestats.AccountStats, error)
 }
 
+type antigravityRecentStatsPrefetchContextKeyType struct{}
 type windowCostPrefetchContextKeyType struct{}
 
+var antigravityRecentStatsPrefetchContextKey = antigravityRecentStatsPrefetchContextKeyType{}
 var windowCostPrefetchContextKey = windowCostPrefetchContextKeyType{}
 
 func windowCostFromPrefetchContext(ctx context.Context, accountID int64) (float64, bool) {
@@ -3154,6 +3208,67 @@ func (s *GatewayService) withWindowCostPrefetch(ctx context.Context, accounts []
 	}
 
 	return context.WithValue(ctx, windowCostPrefetchContextKey, costs)
+}
+
+func (s *GatewayService) withAntigravityRecentStatsPrefetch(ctx context.Context, accounts []Account) context.Context {
+	if ctx == nil || len(accounts) == 0 || s.usageLogRepo == nil || s.antigravityRecentStatsCache == nil {
+		return ctx
+	}
+	batchReader, ok := s.usageLogRepo.(accountRecentSuccessStatsBatchReader)
+	if !ok {
+		return ctx
+	}
+
+	accountIDs := make([]int64, 0, len(accounts))
+	seen := make(map[int64]struct{}, len(accounts))
+	statsByAccount := make(map[int64]*RecentSuccessStats)
+	missingIDs := make([]int64, 0, len(accounts))
+	for i := range accounts {
+		account := &accounts[i]
+		if account == nil || account.Platform != PlatformAntigravity || account.ID <= 0 {
+			continue
+		}
+		if _, exists := seen[account.ID]; exists {
+			continue
+		}
+		seen[account.ID] = struct{}{}
+		accountIDs = append(accountIDs, account.ID)
+		if cached, found := s.antigravityRecentStatsCache.Get(antigravityRecentStatsCacheKey(account.ID)); found {
+			if stats, ok := cached.(*RecentSuccessStats); ok && stats != nil {
+				statsByAccount[account.ID] = cloneRecentSuccessStats(stats)
+				continue
+			}
+		}
+		missingIDs = append(missingIDs, account.ID)
+	}
+	if len(accountIDs) == 0 {
+		return ctx
+	}
+
+	if len(missingIDs) > 0 {
+		since := time.Now().Add(-antigravityRecentStatsWindow)
+		fetched, err := batchReader.GetAccountRecentSuccessStatsBatch(ctx, missingIDs, since)
+		if err != nil {
+			logger.LegacyPrintf("service.gateway", "antigravity_recent_stats batch query failed: accounts=%d err=%v", len(missingIDs), err)
+		} else {
+			for _, accountID := range missingIDs {
+				stats := fetched[accountID]
+				if stats == nil {
+					stats = &RecentSuccessStats{}
+				}
+				cloned := cloneRecentSuccessStats(stats)
+				statsByAccount[accountID] = cloned
+				s.antigravityRecentStatsCache.Set(antigravityRecentStatsCacheKey(accountID), cloned, antigravityRecentStatsCacheTTL)
+			}
+		}
+	}
+
+	for _, accountID := range accountIDs {
+		if _, exists := statsByAccount[accountID]; !exists {
+			statsByAccount[accountID] = &RecentSuccessStats{}
+		}
+	}
+	return context.WithValue(ctx, antigravityRecentStatsPrefetchContextKey, statsByAccount)
 }
 
 // isAccountSchedulableForQuota 检查账号是否在配额限制内
@@ -3702,6 +3817,7 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 		// 提前预取窗口费用+RPM 计数，确保 routing 段内的调度检查调用能命中缓存
 		ctx = s.withWindowCostPrefetch(ctx, accounts)
 		ctx = s.withRPMPrefetch(ctx, accounts)
+		ctx = s.withAntigravityRecentStatsPrefetch(ctx, accounts)
 		if platform == PlatformAntigravity {
 			antigravityLegacyTraceCandidates = s.buildAntigravitySelectionTraceCandidates(ctx, accounts, requestedModel, excludedIDs)
 		}
@@ -3856,6 +3972,7 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 	// 批量预取窗口费用+RPM 计数，避免逐个账号查询（N+1）
 	ctx = s.withWindowCostPrefetch(ctx, accounts)
 	ctx = s.withRPMPrefetch(ctx, accounts)
+	ctx = s.withAntigravityRecentStatsPrefetch(ctx, accounts)
 	if platform == PlatformAntigravity && len(antigravityLegacyTraceCandidates) == 0 {
 		antigravityLegacyTraceCandidates = s.buildAntigravitySelectionTraceCandidates(ctx, accounts, requestedModel, excludedIDs)
 	}
@@ -4009,6 +4126,7 @@ func (s *GatewayService) selectAccountWithMixedScheduling(ctx context.Context, g
 		// 提前预取窗口费用+RPM 计数，确保 routing 段内的调度检查调用能命中缓存
 		ctx = s.withWindowCostPrefetch(ctx, accounts)
 		ctx = s.withRPMPrefetch(ctx, accounts)
+		ctx = s.withAntigravityRecentStatsPrefetch(ctx, accounts)
 
 		routingSet := make(map[int64]struct{}, len(routingAccountIDs))
 		for _, id := range routingAccountIDs {
@@ -4107,6 +4225,7 @@ func (s *GatewayService) selectAccountWithMixedScheduling(ctx context.Context, g
 	// 批量预取窗口费用+RPM 计数，避免逐个账号查询（N+1）
 	ctx = s.withWindowCostPrefetch(ctx, accounts)
 	ctx = s.withRPMPrefetch(ctx, accounts)
+	ctx = s.withAntigravityRecentStatsPrefetch(ctx, accounts)
 
 	// 3. 按优先级+最久未用选择（考虑模型支持和混合调度）
 	// needsUpstreamCheck 仅在主选择循环中使用；粘性会话命中时跳过此检查。
@@ -4196,16 +4315,20 @@ type selectionFailureDiagnosis struct {
 }
 
 type antigravitySelectionCandidateTrace struct {
-	AccountID          int64  `json:"account_id"`
-	Mode               string `json:"mode,omitempty"`
-	Status             string `json:"status,omitempty"`
-	Reason             string `json:"reason,omitempty"`
-	Detail             string `json:"detail,omitempty"`
-	Priority           int    `json:"priority,omitempty"`
-	LoadRate           int    `json:"load_rate,omitempty"`
-	CurrentConcurrency int    `json:"current_concurrency,omitempty"`
-	WaitingCount       int    `json:"waiting_count,omitempty"`
-	LastUsedAt         string `json:"last_used_at,omitempty"`
+	AccountID           int64   `json:"account_id"`
+	Mode                string  `json:"mode,omitempty"`
+	Status              string  `json:"status,omitempty"`
+	Reason              string  `json:"reason,omitempty"`
+	Detail              string  `json:"detail,omitempty"`
+	RuntimePenaltyMilli int     `json:"runtime_penalty_milli,omitempty"`
+	RecentRequestCount  int     `json:"recent_request_count,omitempty"`
+	RecentSuccessCount  int     `json:"recent_success_count,omitempty"`
+	RecentSuccessRate   float64 `json:"recent_success_rate,omitempty"`
+	Priority            int     `json:"priority,omitempty"`
+	LoadRate            int     `json:"load_rate,omitempty"`
+	CurrentConcurrency  int     `json:"current_concurrency,omitempty"`
+	WaitingCount        int     `json:"waiting_count,omitempty"`
+	LastUsedAt          string  `json:"last_used_at,omitempty"`
 }
 
 type antigravitySelectionRoundTrace struct {
@@ -4468,13 +4591,21 @@ func (s *GatewayService) buildAntigravitySelectionTraceCandidates(
 		acc := &accounts[i]
 		diagnosis := s.diagnoseSelectionFailure(ctx, acc, requestedModel, PlatformAntigravity, excludedIDs, false)
 		item := antigravitySelectionCandidateTrace{
-			AccountID: acc.ID,
-			Mode:      antigravitySelectionModeLabel(s.antigravityModelSelectionMode(ctx, acc, requestedModel)),
-			Status:    "eligible",
-			Priority:  acc.Priority,
+			AccountID:           acc.ID,
+			Mode:                antigravitySelectionModeLabel(s.antigravityModelSelectionMode(ctx, acc, requestedModel)),
+			Status:              "eligible",
+			RuntimePenaltyMilli: s.antigravityRuntimePenaltyMilli(ctx, acc.ID),
+			Priority:            acc.Priority,
 		}
 		if acc.LastUsedAt != nil {
 			item.LastUsedAt = acc.LastUsedAt.UTC().Format(time.RFC3339)
+		}
+		if stats, ok := antigravityRecentStatsFromPrefetchContext(ctx, acc.ID); ok && stats != nil {
+			item.RecentRequestCount = stats.RecentRequestCount
+			item.RecentSuccessCount = stats.RecentSuccessCount
+			if stats.RecentRequestCount > 0 {
+				item.RecentSuccessRate = math.Round(clamp01(float64(stats.RecentSuccessCount)/float64(stats.RecentRequestCount))*10000) / 10000
+			}
 		}
 		if diagnosis.Category != "eligible" {
 			item.Status = "filtered"

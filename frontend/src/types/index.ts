@@ -700,6 +700,7 @@ export interface Account {
   last_used_at: string | null
   last_success_at?: string | null
   recent_success_count?: number
+  recent_request_count?: number
   expires_at: number | null
   auto_pause_on_expired: boolean
   created_at: string

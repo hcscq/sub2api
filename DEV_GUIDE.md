@@ -49,14 +49,15 @@ npm install -g pnpm
 |----------|----------|----------|
 | **backend-ci.yml** | push, pull_request | 单元测试 + 集成测试 + golangci-lint v2.7 |
 | **security-scan.yml** | push, pull_request, 每周一 | govulncheck + gosec + pnpm audit |
-| **release.yml** | tag `v*` 或手动触发 | 构建 GitHub Release / GHCR 镜像 / VERSION 回写 |
+| **release.yml** | tag `v*` 或手动触发 | 远端构建 GitHub Release / GHCR 镜像 / VERSION 回写 |
 
 ### CI 要求
 
 - Go 版本必须是 **1.26.2**
 - 前端使用 `pnpm install --frozen-lockfile`，必须提交 `pnpm-lock.yaml`
+- 正式发版统一走 GitHub Actions 远端构建；不要在本地执行 `pnpm run build`、`go build`、`docker build`、`deploy/build_image.sh` 或本地 GoReleaser
 
-详细发版流程与本机验收步骤见 [docs/RELEASE_CN.md](docs/RELEASE_CN.md)。
+详细发版流程见 [docs/RELEASE_CN.md](docs/RELEASE_CN.md)。默认发布不包含本地编译或镜像打包；部署验收仅在明确需要时单独执行。
 
 ### 本地测试命令
 

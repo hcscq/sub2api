@@ -145,10 +145,11 @@ type WindowStats struct {
 	UserCost     float64 `json:"user_cost"`
 }
 
-// RecentSuccessStats is a runtime view of whether an account has succeeded recently.
+// RecentSuccessStats is a runtime summary of recent account requests.
 type RecentSuccessStats struct {
 	LastSuccessAt      *time.Time `json:"last_success_at,omitempty"`
 	RecentSuccessCount int        `json:"recent_success_count"`
+	RecentRequestCount int        `json:"recent_request_count"`
 }
 
 // UsageProgress 使用量进度
@@ -1078,8 +1079,10 @@ func (s *AccountUsageService) GetTodayStatsBatch(ctx context.Context, accountIDs
 	return result, nil
 }
 
-// GetRecentSuccessStatsBatch 批量获取账号最近成功情况。
-// RecentSuccessCount 统计 since 之后的 usage_logs 成功次数；LastSuccessAt 为最近一次成功时间。
+// GetRecentSuccessStatsBatch 批量获取账号最近请求情况。
+// RecentSuccessCount 统计 since 之后的 usage_logs 成功次数；
+// RecentRequestCount 统计 since 之后的总调用次数（成功 + 最终失败）；
+// LastSuccessAt 为最近一次成功时间。
 func (s *AccountUsageService) GetRecentSuccessStatsBatch(ctx context.Context, accountIDs []int64, since time.Time) (map[int64]*RecentSuccessStats, error) {
 	uniqueIDs := make([]int64, 0, len(accountIDs))
 	seen := make(map[int64]struct{}, len(accountIDs))

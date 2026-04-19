@@ -213,6 +213,7 @@
             <AccountRecentSuccessCell
               :last-success-at="row.last_success_at ?? null"
               :recent-success-count="row.recent_success_count ?? 0"
+              :recent-request-count="row.recent_request_count ?? 0"
             />
           </template>
           <template #cell-today_stats="{ row }">
@@ -790,6 +791,7 @@ const shouldReplaceAutoRefreshRow = (current: Account, next: Account) => {
     current.current_window_cost !== next.current_window_cost ||
     current.active_sessions !== next.active_sessions ||
     current.schedulable !== next.schedulable ||
+    current.recent_request_count !== next.recent_request_count ||
     current.recent_success_count !== next.recent_success_count ||
     current.last_success_at !== next.last_success_at ||
     current.status !== next.status ||

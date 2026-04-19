@@ -177,6 +177,7 @@ func applyRecentSuccessStats(account *dto.Account, stats *service.RecentSuccessS
 	}
 	account.LastSuccessAt = stats.LastSuccessAt
 	account.RecentSuccessCount = stats.RecentSuccessCount
+	account.RecentRequestCount = stats.RecentRequestCount
 }
 
 func (h *AccountHandler) buildAccountResponseWithRuntime(ctx context.Context, account *service.Account) AccountWithConcurrency {

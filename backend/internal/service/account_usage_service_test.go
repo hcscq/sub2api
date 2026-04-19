@@ -41,6 +41,7 @@ func TestAccountUsageService_GetRecentSuccessStatsBatch(t *testing.T) {
 				101: {
 					LastSuccessAt:      &lastSuccess,
 					RecentSuccessCount: 3,
+					RecentRequestCount: 5,
 				},
 			},
 		}
@@ -51,9 +52,11 @@ func TestAccountUsageService_GetRecentSuccessStatsBatch(t *testing.T) {
 		require.Equal(t, 1, repo.batchCalls)
 		require.Len(t, stats, 2)
 		require.Equal(t, 3, stats[101].RecentSuccessCount)
+		require.Equal(t, 5, stats[101].RecentRequestCount)
 		require.NotNil(t, stats[101].LastSuccessAt)
 		require.Equal(t, lastSuccess, *stats[101].LastSuccessAt)
 		require.Zero(t, stats[202].RecentSuccessCount)
+		require.Zero(t, stats[202].RecentRequestCount)
 		require.Nil(t, stats[202].LastSuccessAt)
 	})
 
@@ -64,8 +67,10 @@ func TestAccountUsageService_GetRecentSuccessStatsBatch(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, stats, 2)
 		require.Zero(t, stats[301].RecentSuccessCount)
+		require.Zero(t, stats[301].RecentRequestCount)
 		require.Nil(t, stats[301].LastSuccessAt)
 		require.Zero(t, stats[302].RecentSuccessCount)
+		require.Zero(t, stats[302].RecentRequestCount)
 		require.Nil(t, stats[302].LastSuccessAt)
 	})
 }

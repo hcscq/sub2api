@@ -155,6 +155,7 @@ type Account struct {
 	LastUsedAt         *time.Time     `json:"last_used_at"`
 	LastSuccessAt      *time.Time     `json:"last_success_at"`
 	RecentSuccessCount int            `json:"recent_success_count"`
+	RecentRequestCount int            `json:"recent_request_count"`
 	ExpiresAt          *int64         `json:"expires_at"`
 	AutoPauseOnExpired bool           `json:"auto_pause_on_expired"`
 	CreatedAt          time.Time      `json:"created_at"`
