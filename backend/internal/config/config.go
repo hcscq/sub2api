@@ -408,6 +408,16 @@ type GatewayConfig struct {
 	// Gemini 账户切换最大次数（Gemini 平台单独配置，因 API 限制更严格）
 	MaxAccountSwitchesGemini int `mapstructure:"max_account_switches_gemini"`
 
+	// Antigravity 快速 failover 总时间预算（毫秒）
+	// 当多次切号都在该窗口内快速失败时，允许继续探索更多凭据/循环重试。
+	AntigravityFastFailoverWindowMs int `mapstructure:"antigravity_fast_failover_window_ms"`
+	// Antigravity “快速失败”判定阈值（毫秒）
+	AntigravityFastFailoverThresholdMs int `mapstructure:"antigravity_fast_failover_threshold_ms"`
+	// Antigravity 在时间预算内允许突破基础切号上限的额外切号次数
+	AntigravityFastFailoverMaxExtraSwitches int `mapstructure:"antigravity_fast_failover_max_extra_switches"`
+	// Antigravity 候选池循环重试前的短退避（毫秒）
+	AntigravityFastFailoverRecycleDelayMs int `mapstructure:"antigravity_fast_failover_recycle_delay_ms"`
+
 	// Antigravity 429 fallback 限流时间（分钟），解析重置时间失败时使用
 	AntigravityFallbackCooldownMinutes int `mapstructure:"antigravity_fallback_cooldown_minutes"`
 
@@ -1356,6 +1366,10 @@ func setDefaults() {
 	viper.SetDefault("gateway.failover_on_400", false)
 	viper.SetDefault("gateway.max_account_switches", 10)
 	viper.SetDefault("gateway.max_account_switches_gemini", 3)
+	viper.SetDefault("gateway.antigravity_fast_failover_window_ms", 8000)
+	viper.SetDefault("gateway.antigravity_fast_failover_threshold_ms", 1500)
+	viper.SetDefault("gateway.antigravity_fast_failover_max_extra_switches", 8)
+	viper.SetDefault("gateway.antigravity_fast_failover_recycle_delay_ms", 250)
 	viper.SetDefault("gateway.force_codex_cli", false)
 	viper.SetDefault("gateway.openai_passthrough_allow_timeout_headers", false)
 	// OpenAI Responses WebSocket（默认开启；可通过 force_http 紧急回滚）

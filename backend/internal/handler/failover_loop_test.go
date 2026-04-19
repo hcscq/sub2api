@@ -823,3 +823,86 @@ func TestHandleSelectionExhausted(t *testing.T) {
 		require.Less(t, elapsed, 100*time.Millisecond, "多账号模型容量切换不应在选号耗尽时再次等待")
 	})
 }
+
+func TestHandleFailoverErrorWithDuration_AntigravityFastBudgetAllowsExtraSwitch(t *testing.T) {
+	mock := &mockTempUnscheduler{}
+	fs := NewFailoverState(1, false)
+	fs.SetAntigravityFastFailoverBudget(AntigravityFastFailoverBudget{
+		TotalWindow:       200 * time.Millisecond,
+		FastFailThreshold: 50 * time.Millisecond,
+		MaxExtraSwitches:  2,
+	})
+
+	err := newTestFailoverErr(503, false, false)
+
+	action := fs.HandleFailoverErrorWithDuration(context.Background(), mock, 100, service.PlatformAntigravity, err, 10*time.Millisecond)
+	require.Equal(t, FailoverContinue, action)
+	require.Equal(t, 1, fs.SwitchCount)
+	require.Zero(t, fs.antigravityExtraUsed)
+
+	action = fs.HandleFailoverErrorWithDuration(context.Background(), mock, 200, service.PlatformAntigravity, err, 10*time.Millisecond)
+	require.Equal(t, FailoverContinue, action)
+	require.Equal(t, 2, fs.SwitchCount)
+	require.Equal(t, 1, fs.antigravityExtraUsed)
+}
+
+func TestHandleFailoverErrorWithDuration_ModelCapacityBudgetAllowsExtraSwitch(t *testing.T) {
+	mock := &mockTempUnscheduler{}
+	fs := NewFailoverState(10, false)
+	fs.SetAntigravityFastFailoverBudget(AntigravityFastFailoverBudget{
+		TotalWindow:       200 * time.Millisecond,
+		FastFailThreshold: 50 * time.Millisecond,
+		MaxExtraSwitches:  2,
+	})
+	fs.modelCapacitySwitches = maxModelCapacitySwitches
+
+	err := newTestFailoverErr(503, false, false)
+	err.ModelCapacityExhausted = true
+
+	action := fs.HandleFailoverErrorWithDuration(context.Background(), mock, 300, service.PlatformAntigravity, err, 10*time.Millisecond)
+	require.Equal(t, FailoverContinue, action)
+	require.Equal(t, maxModelCapacitySwitches+1, fs.modelCapacitySwitches)
+	require.Equal(t, 1, fs.SwitchCount)
+	require.Equal(t, 1, fs.antigravityExtraUsed)
+}
+
+func TestHandleFailoverErrorWithDuration_AntigravitySlowFailDoesNotExtend(t *testing.T) {
+	mock := &mockTempUnscheduler{}
+	fs := NewFailoverState(1, false)
+	fs.SetAntigravityFastFailoverBudget(AntigravityFastFailoverBudget{
+		TotalWindow:       200 * time.Millisecond,
+		FastFailThreshold: 50 * time.Millisecond,
+		MaxExtraSwitches:  2,
+	})
+
+	err := newTestFailoverErr(503, false, false)
+
+	action := fs.HandleFailoverErrorWithDuration(context.Background(), mock, 100, service.PlatformAntigravity, err, 10*time.Millisecond)
+	require.Equal(t, FailoverContinue, action)
+
+	action = fs.HandleFailoverErrorWithDuration(context.Background(), mock, 200, service.PlatformAntigravity, err, 80*time.Millisecond)
+	require.Equal(t, FailoverExhausted, action)
+	require.Equal(t, 1, fs.SwitchCount)
+	require.Zero(t, fs.antigravityExtraUsed)
+	require.False(t, fs.antigravityBudgetFast)
+}
+
+func TestHandleSelectionExhausted_AntigravityFastBudgetRecyclesCandidates(t *testing.T) {
+	mock := &mockTempUnscheduler{}
+	fs := NewFailoverState(1, false)
+	fs.SetAntigravityFastFailoverBudget(AntigravityFastFailoverBudget{
+		TotalWindow:       200 * time.Millisecond,
+		FastFailThreshold: 50 * time.Millisecond,
+		RecycleDelay:      0,
+		MaxExtraSwitches:  2,
+	})
+
+	err := newTestFailoverErr(503, false, false)
+	action := fs.HandleFailoverErrorWithDuration(context.Background(), mock, 100, service.PlatformAntigravity, err, 10*time.Millisecond)
+	require.Equal(t, FailoverContinue, action)
+	require.Contains(t, fs.FailedAccountIDs, int64(100))
+
+	action = fs.HandleSelectionExhausted(context.Background())
+	require.Equal(t, FailoverContinue, action)
+	require.Empty(t, fs.FailedAccountIDs)
+}

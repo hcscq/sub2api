@@ -158,6 +158,7 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 	c.Request = c.Request.WithContext(service.WithSingleAccountRetry(c.Request.Context(), singleAccountRetryEnabled, h.metadataBridgeEnabled()))
 	fs := NewFailoverState(h.maxAccountSwitches, false)
 	fs.SetSingleAccountBackoffEnabled(singleAccountRetryEnabled)
+	h.configureFailoverState(fs)
 
 	for {
 		selection, err := h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), apiKey.GroupID, sessionHash, reqModel, fs.FailedAccountIDs, "", int64(0))
@@ -223,6 +224,7 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 		if channelMapping.Mapped {
 			forwardBody = h.gatewayService.ReplaceModelInBody(body, channelMapping.MappedModel)
 		}
+		forwardStart := time.Now()
 		result, err := h.gatewayService.ForwardAsChatCompletions(c.Request.Context(), c, account, forwardBody, parsedReq)
 
 		if accountReleaseFunc != nil {
@@ -236,7 +238,7 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 					h.handleCCFailoverExhausted(c, failoverErr, true)
 					return
 				}
-				action := fs.HandleFailoverError(c.Request.Context(), h.gatewayService, account.ID, account.Platform, failoverErr)
+				action := fs.HandleFailoverErrorWithDuration(c.Request.Context(), h.gatewayService, account.ID, account.Platform, failoverErr, time.Since(forwardStart))
 				switch action {
 				case FailoverContinue:
 					continue

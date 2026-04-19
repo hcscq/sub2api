@@ -107,6 +107,18 @@ func NewGatewayHandler(
 	}
 }
 
+func (h *GatewayHandler) configureFailoverState(fs *FailoverState) {
+	if h == nil || fs == nil || h.cfg == nil {
+		return
+	}
+	fs.SetAntigravityFastFailoverBudget(AntigravityFastFailoverBudget{
+		TotalWindow:       time.Duration(h.cfg.Gateway.AntigravityFastFailoverWindowMs) * time.Millisecond,
+		FastFailThreshold: time.Duration(h.cfg.Gateway.AntigravityFastFailoverThresholdMs) * time.Millisecond,
+		RecycleDelay:      time.Duration(h.cfg.Gateway.AntigravityFastFailoverRecycleDelayMs) * time.Millisecond,
+		MaxExtraSwitches:  h.cfg.Gateway.AntigravityFastFailoverMaxExtraSwitches,
+	})
+}
+
 // Messages handles Claude API compatible messages endpoint
 // POST /v1/messages
 func (h *GatewayHandler) Messages(c *gin.Context) {
@@ -294,6 +306,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 
 		fs := NewFailoverState(h.maxAccountSwitchesGemini, hasBoundSession)
 		fs.SetSingleAccountBackoffEnabled(singleAccountRetryEnabled)
+		h.configureFailoverState(fs)
 
 		for {
 			selection, err := h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), apiKey.GroupID, sessionKey, reqModel, fs.FailedAccountIDs, "", int64(0)) // Gemini 不使用会话限制
@@ -400,6 +413,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			}
 			// 记录 Forward 前已写入字节数，Forward 后若增加则说明 SSE 内容已发，禁止 failover
 			writerSizeBeforeForward := c.Writer.Size()
+			forwardStart := time.Now()
 			if account.Platform == service.PlatformAntigravity {
 				h.gatewayService.MarkAntigravitySelectionAttempt(requestCtx, account)
 				result, err = h.antigravityGatewayService.ForwardGemini(requestCtx, c, account, reqModel, "generateContent", reqStream, body, hasBoundSession)
@@ -420,7 +434,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 						h.handleFailoverExhausted(c, failoverErr, service.PlatformGemini, true)
 						return
 					}
-					action := fs.HandleFailoverError(c.Request.Context(), h.gatewayService, account.ID, account.Platform, failoverErr)
+					action := fs.HandleFailoverErrorWithDuration(c.Request.Context(), h.gatewayService, account.ID, account.Platform, failoverErr, time.Since(forwardStart))
 					switch action {
 					case FailoverContinue:
 						continue
@@ -526,6 +540,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 
 		fs := NewFailoverState(h.maxAccountSwitches, hasBoundSession)
 		fs.SetSingleAccountBackoffEnabled(singleAccountRetryEnabled)
+		h.configureFailoverState(fs)
 		retryWithFallback := false
 
 		for {
@@ -694,6 +709,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			}
 			// 记录 Forward 前已写入字节数，Forward 后若增加则说明 SSE 内容已发，禁止 failover
 			writerSizeBeforeForward := c.Writer.Size()
+			forwardStart := time.Now()
 			if account.Platform == service.PlatformAntigravity && account.Type != service.AccountTypeAPIKey {
 				h.gatewayService.MarkAntigravitySelectionAttempt(requestCtx, account)
 				result, err = h.antigravityGatewayService.Forward(requestCtx, c, account, body, hasBoundSession)
@@ -772,7 +788,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 						h.handleFailoverExhausted(c, failoverErr, account.Platform, true)
 						return
 					}
-					action := fs.HandleFailoverError(c.Request.Context(), h.gatewayService, account.ID, account.Platform, failoverErr)
+					action := fs.HandleFailoverErrorWithDuration(c.Request.Context(), h.gatewayService, account.ID, account.Platform, failoverErr, time.Since(forwardStart))
 					switch action {
 					case FailoverContinue:
 						continue

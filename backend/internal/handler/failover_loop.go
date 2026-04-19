@@ -42,6 +42,19 @@ const (
 	maxModelCapacitySwitches = 2
 )
 
+// AntigravityFastFailoverBudget 控制 Antigravity 快速 failover 的额外探索窗口。
+// 仅在多次上游快速失败且总耗时仍落在窗口内时，允许突破基础切号上限/循环重试候选池。
+type AntigravityFastFailoverBudget struct {
+	TotalWindow       time.Duration
+	FastFailThreshold time.Duration
+	RecycleDelay      time.Duration
+	MaxExtraSwitches  int
+}
+
+func (b AntigravityFastFailoverBudget) enabled() bool {
+	return b.TotalWindow > 0 && b.FastFailThreshold > 0 && b.MaxExtraSwitches > 0
+}
+
 // FailoverState 跨循环迭代共享的 failover 状态
 type FailoverState struct {
 	SwitchCount           int
@@ -53,6 +66,11 @@ type FailoverState struct {
 	hasBoundSession       bool
 	singleAccountBackoff  bool
 	modelCapacitySwitches int
+	startedAt             time.Time
+	antigravityBudget     AntigravityFastFailoverBudget
+	antigravityBudgetSeen bool
+	antigravityBudgetFast bool
+	antigravityExtraUsed  int
 }
 
 // NewFailoverState 创建 failover 状态
@@ -62,6 +80,8 @@ func NewFailoverState(maxSwitches int, hasBoundSession bool) *FailoverState {
 		FailedAccountIDs:      make(map[int64]struct{}),
 		SameAccountRetryCount: make(map[int64]int),
 		hasBoundSession:       hasBoundSession,
+		startedAt:             time.Now(),
+		antigravityBudgetFast: true,
 	}
 }
 
@@ -74,14 +94,38 @@ func (s *FailoverState) SetSingleAccountBackoffEnabled(enabled bool) {
 	s.singleAccountBackoff = enabled
 }
 
+// SetAntigravityFastFailoverBudget 配置 Antigravity 快速 failover 的额外时间预算。
+func (s *FailoverState) SetAntigravityFastFailoverBudget(budget AntigravityFastFailoverBudget) {
+	if s == nil {
+		return
+	}
+	if budget.RecycleDelay < 0 {
+		budget.RecycleDelay = 0
+	}
+	s.antigravityBudget = budget
+}
+
 // HandleFailoverError 处理 UpstreamFailoverError，返回下一步动作。
-// 包含：缓存计费判断、同账号重试、临时封禁、切换计数、Antigravity 延时。
+// 兼容旧调用方：未提供单次尝试耗时，按 0 处理。
 func (s *FailoverState) HandleFailoverError(
 	ctx context.Context,
 	gatewayService TempUnscheduler,
 	accountID int64,
 	platform string,
 	failoverErr *service.UpstreamFailoverError,
+) FailoverAction {
+	return s.HandleFailoverErrorWithDuration(ctx, gatewayService, accountID, platform, failoverErr, 0)
+}
+
+// HandleFailoverErrorWithDuration 处理 UpstreamFailoverError，返回下一步动作。
+// 包含：缓存计费判断、同账号重试、临时封禁、切换计数、Antigravity 延时。
+func (s *FailoverState) HandleFailoverErrorWithDuration(
+	ctx context.Context,
+	gatewayService TempUnscheduler,
+	accountID int64,
+	platform string,
+	failoverErr *service.UpstreamFailoverError,
+	attemptDuration time.Duration,
 ) FailoverAction {
 	s.LastFailoverErr = failoverErr
 
@@ -100,7 +144,12 @@ func (s *FailoverState) HandleFailoverError(
 		)
 		if !s.singleAccountBackoff {
 			s.FailedAccountIDs[accountID] = struct{}{}
+			s.observeAntigravityBudget(platform, failoverErr, attemptDuration)
+			allowExtraSwitch := false
 			if s.modelCapacitySwitches >= maxModelCapacitySwitches || s.SwitchCount >= s.MaxSwitches {
+				allowExtraSwitch = s.tryUseAntigravityExtraSwitch(ctx, failoverErr, attemptDuration, "model_capacity")
+			}
+			if !allowExtraSwitch && (s.modelCapacitySwitches >= maxModelCapacitySwitches || s.SwitchCount >= s.MaxSwitches) {
 				return FailoverExhausted
 			}
 			s.modelCapacitySwitches++
@@ -138,9 +187,10 @@ func (s *FailoverState) HandleFailoverError(
 
 	// 加入失败列表
 	s.FailedAccountIDs[accountID] = struct{}{}
+	s.observeAntigravityBudget(platform, failoverErr, attemptDuration)
 
 	// 检查是否耗尽
-	if s.SwitchCount >= s.MaxSwitches {
+	if s.SwitchCount >= s.MaxSwitches && !s.tryUseAntigravityExtraSwitch(ctx, failoverErr, attemptDuration, "switch_limit") {
 		return FailoverExhausted
 	}
 
@@ -199,6 +249,22 @@ func (s *FailoverState) HandleSelectionExhausted(ctx context.Context) FailoverAc
 		s.FailedAccountIDs = make(map[int64]struct{})
 		return FailoverContinue
 	}
+	if s.canRecycleAntigravityCandidates() {
+		logger.FromContext(ctx).Warn("gateway.failover_fast_failover_recycle_candidates",
+			zap.Duration("elapsed", time.Since(s.startedAt).Truncate(time.Millisecond)),
+			zap.Duration("recycle_delay", s.antigravityBudget.RecycleDelay),
+			zap.Int("failed_accounts", len(s.FailedAccountIDs)),
+			zap.Int("switch_count", s.SwitchCount),
+			zap.Int("max_switches", s.MaxSwitches),
+			zap.Int("extra_switches_used", s.antigravityExtraUsed),
+			zap.Int("extra_switches_max", s.antigravityBudget.MaxExtraSwitches),
+		)
+		if !sleepWithContext(ctx, s.antigravityBudget.RecycleDelay) {
+			return FailoverCanceled
+		}
+		s.FailedAccountIDs = make(map[int64]struct{})
+		return FailoverContinue
+	}
 	return FailoverExhausted
 }
 
@@ -218,5 +284,90 @@ func sleepWithContext(ctx context.Context, d time.Duration) bool {
 		return false
 	case <-time.After(d):
 		return true
+	}
+}
+
+func (s *FailoverState) observeAntigravityBudget(platform string, failoverErr *service.UpstreamFailoverError, attemptDuration time.Duration) {
+	if s == nil || platform != service.PlatformAntigravity || failoverErr == nil || !s.antigravityBudget.enabled() {
+		return
+	}
+	if !s.antigravityBudgetSeen {
+		s.antigravityBudgetSeen = true
+		s.antigravityBudgetFast = true
+	}
+	if !isAntigravityFastFailoverCandidate(failoverErr) || attemptDuration > s.antigravityBudget.FastFailThreshold {
+		s.antigravityBudgetFast = false
+	}
+}
+
+func (s *FailoverState) canUseAntigravityBudget() bool {
+	if s == nil || !s.antigravityBudget.enabled() || !s.antigravityBudgetSeen || !s.antigravityBudgetFast {
+		return false
+	}
+	return time.Since(s.startedAt) <= s.antigravityBudget.TotalWindow
+}
+
+func (s *FailoverState) tryUseAntigravityExtraSwitch(
+	ctx context.Context,
+	failoverErr *service.UpstreamFailoverError,
+	attemptDuration time.Duration,
+	reason string,
+) bool {
+	if s == nil || failoverErr == nil || !s.canUseAntigravityBudget() {
+		return false
+	}
+	if s.antigravityExtraUsed >= s.antigravityBudget.MaxExtraSwitches {
+		return false
+	}
+	s.antigravityExtraUsed++
+	logger.FromContext(ctx).Warn("gateway.failover_fast_failover_extend",
+		zap.String("reason", reason),
+		zap.Int("upstream_status", failoverErr.StatusCode),
+		zap.Bool("model_capacity_exhausted", failoverErr.ModelCapacityExhausted),
+		zap.Duration("attempt_duration", attemptDuration.Truncate(time.Millisecond)),
+		zap.Duration("elapsed", time.Since(s.startedAt).Truncate(time.Millisecond)),
+		zap.Int("switch_count", s.SwitchCount),
+		zap.Int("max_switches", s.MaxSwitches),
+		zap.Int("extra_switches_used", s.antigravityExtraUsed),
+		zap.Int("extra_switches_max", s.antigravityBudget.MaxExtraSwitches),
+	)
+	return true
+}
+
+func (s *FailoverState) canRecycleAntigravityCandidates() bool {
+	if s == nil || !s.canUseAntigravityBudget() || s.LastFailoverErr == nil {
+		return false
+	}
+	if s.SwitchCount >= s.MaxSwitches && s.antigravityExtraUsed >= s.antigravityBudget.MaxExtraSwitches {
+		return false
+	}
+	if s.LastFailoverErr.ModelCapacityExhausted &&
+		s.modelCapacitySwitches >= maxModelCapacitySwitches &&
+		s.antigravityExtraUsed >= s.antigravityBudget.MaxExtraSwitches {
+		return false
+	}
+	if !isAntigravityFastFailoverCandidate(s.LastFailoverErr) {
+		return false
+	}
+	return len(s.FailedAccountIDs) > 0
+}
+
+func isAntigravityFastFailoverCandidate(failoverErr *service.UpstreamFailoverError) bool {
+	if failoverErr == nil {
+		return false
+	}
+	if failoverErr.ModelCapacityExhausted {
+		return true
+	}
+	switch failoverErr.StatusCode {
+	case http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout,
+		529:
+		return true
+	default:
+		return false
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/domain"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/antigravity"
@@ -356,6 +357,7 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 
 	fs := NewFailoverState(h.maxAccountSwitchesGemini, hasBoundSession)
 	fs.SetSingleAccountBackoffEnabled(singleAccountRetryEnabled)
+	h.configureFailoverState(fs)
 
 	for {
 		selection, err := h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), apiKey.GroupID, sessionKey, modelName, fs.FailedAccountIDs, "", int64(0)) // Gemini 不使用会话限制
@@ -464,6 +466,7 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 		if fs.SwitchCount > 0 {
 			requestCtx = service.WithAccountSwitchCount(requestCtx, fs.SwitchCount, h.metadataBridgeEnabled())
 		}
+		forwardStart := time.Now()
 		if account.Platform == service.PlatformAntigravity && account.Type != service.AccountTypeAPIKey {
 			h.gatewayService.MarkAntigravitySelectionAttempt(requestCtx, account)
 			result, err = h.antigravityGatewayService.ForwardGemini(requestCtx, c, account, modelName, action, stream, body, hasBoundSession)
@@ -479,7 +482,7 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 				if account.Platform == service.PlatformAntigravity {
 					h.gatewayService.ReportAntigravityResult(account.ID, false, nil)
 				}
-				failoverAction := fs.HandleFailoverError(c.Request.Context(), h.gatewayService, account.ID, account.Platform, failoverErr)
+				failoverAction := fs.HandleFailoverErrorWithDuration(c.Request.Context(), h.gatewayService, account.ID, account.Platform, failoverErr, time.Since(forwardStart))
 				switch failoverAction {
 				case FailoverContinue:
 					continue
