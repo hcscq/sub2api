@@ -57,6 +57,7 @@ const (
 	defaultModelsListCacheTTL     = 15 * time.Second
 	antigravityRecentStatsWindow  = 15 * time.Minute
 	antigravityRecentStatsCacheTTL = 15 * time.Second
+	antigravityWarmLoadBiasThreshold = 15
 	postUsageBillingTimeout       = 15 * time.Second
 	debugGatewayBodyEnv           = "SUB2API_DEBUG_GATEWAY_BODY"
 )
@@ -2084,10 +2085,17 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 				candidates = s.filterByMinAntigravityRuntimePenalty(ctx, candidates)
 				traceRound.MinRuntimePenaltyIDs = extractAccountLoadIDs(candidates)
 			}
-			// 4. Antigravity 在同运行态层里优先复用已有成功记录的 warm 账号，
-			// 冷号只在没有 warm 候选时再参与竞争，避免前排假活跃号拖慢命中。
+			// 4. Antigravity 在同运行态层里软优先复用 warm 账号，
+			// 但当冷号明显更空闲时允许其参与竞争，避免热点固化在少数 warm 账号上。
 			if platform == PlatformAntigravity {
-				candidates = preferWarmAntigravityAccountLoads(candidates)
+				var warmDecision string
+				var warmMinLoadRate int
+				var coldMinLoadRate int
+				candidates, warmDecision, warmMinLoadRate, coldMinLoadRate = preferWarmAntigravityAccountLoads(candidates)
+				traceRound.WarmPreference = warmDecision
+				traceRound.WarmMinLoadRate = warmMinLoadRate
+				traceRound.ColdMinLoadRate = coldMinLoadRate
+				traceRound.WarmLoadThreshold = antigravityWarmLoadBiasThreshold
 				traceRound.WarmPreferredIDs = extractAccountLoadIDs(candidates)
 			}
 			// 5. 取负载率最低的集合
@@ -2670,24 +2678,45 @@ func (s *GatewayService) preferDirectAntigravityAccounts(ctx context.Context, ac
 	return filtered
 }
 
-func preferWarmAntigravityAccountLoads(accounts []accountWithLoad) []accountWithLoad {
+func preferWarmAntigravityAccountLoads(accounts []accountWithLoad) ([]accountWithLoad, string, int, int) {
 	if len(accounts) == 0 {
-		return accounts
+		return accounts, "", 0, 0
 	}
 	hasWarm := false
 	hasCold := false
+	minWarmLoadRate := 0
+	minColdLoadRate := 0
+	hasWarmLoadRate := false
+	hasColdLoadRate := false
 	for _, item := range accounts {
 		if item.account == nil || item.account.Platform != PlatformAntigravity {
 			continue
 		}
+		loadRate := 0
+		if item.loadInfo != nil {
+			loadRate = item.loadInfo.LoadRate
+		}
 		if item.account.LastUsedAt != nil {
 			hasWarm = true
+			if !hasWarmLoadRate || loadRate < minWarmLoadRate {
+				minWarmLoadRate = loadRate
+				hasWarmLoadRate = true
+			}
 		} else {
 			hasCold = true
+			if !hasColdLoadRate || loadRate < minColdLoadRate {
+				minColdLoadRate = loadRate
+				hasColdLoadRate = true
+			}
 		}
 	}
 	if !hasWarm || !hasCold {
-		return accounts
+		return accounts, "skipped_no_mix", minWarmLoadRate, minColdLoadRate
+	}
+	// Warm 账号只作为软偏好：当冷号明显更空闲时，允许冷号重新参与竞争，
+	// 避免高并发下长期把请求压在少数 warm 账号上。
+	if hasWarmLoadRate && hasColdLoadRate && minWarmLoadRate > minColdLoadRate+antigravityWarmLoadBiasThreshold {
+		return accounts, "bypassed_load_gap", minWarmLoadRate, minColdLoadRate
 	}
 	filtered := make([]accountWithLoad, 0, len(accounts))
 	for _, item := range accounts {
@@ -2696,9 +2725,9 @@ func preferWarmAntigravityAccountLoads(accounts []accountWithLoad) []accountWith
 		}
 	}
 	if len(filtered) == 0 {
-		return accounts
+		return accounts, "skipped_empty_after_filter", minWarmLoadRate, minColdLoadRate
 	}
-	return filtered
+	return filtered, "applied", minWarmLoadRate, minColdLoadRate
 }
 
 func antigravityWarmLastUsedBetter(left, right *Account) (bool, bool) {
@@ -2718,6 +2747,36 @@ func antigravityWarmLastUsedBetter(left, right *Account) (bool, bool) {
 		}
 		return left.LastUsedAt.Before(*right.LastUsedAt), true
 	}
+}
+
+func antigravityWarmLoadBetter(left, right accountWithLoad) (bool, bool) {
+	if left.account == nil || right.account == nil {
+		return false, false
+	}
+	if left.account.Platform != PlatformAntigravity || right.account.Platform != PlatformAntigravity {
+		return false, false
+	}
+	leftWarm := left.account.LastUsedAt != nil
+	rightWarm := right.account.LastUsedAt != nil
+	if leftWarm == rightWarm {
+		return false, false
+	}
+	leftLoadRate := 0
+	if left.loadInfo != nil {
+		leftLoadRate = left.loadInfo.LoadRate
+	}
+	rightLoadRate := 0
+	if right.loadInfo != nil {
+		rightLoadRate = right.loadInfo.LoadRate
+	}
+	loadGap := leftLoadRate - rightLoadRate
+	if loadGap < 0 {
+		loadGap = -loadGap
+	}
+	if loadGap > antigravityWarmLoadBiasThreshold {
+		return false, false
+	}
+	return leftWarm, true
 }
 
 // isAccountInGroup checks if the account belongs to the specified group.
@@ -2932,7 +2991,7 @@ func (s *GatewayService) lessAntigravityLoadCandidate(ctx context.Context, reque
 	if better, decided := s.antigravityRuntimeBetter(ctx, left.account, right.account); decided {
 		return better
 	}
-	if better, decided := antigravityWarmLastUsedBetter(left.account, right.account); decided {
+	if better, decided := antigravityWarmLoadBetter(left, right); decided {
 		return better
 	}
 	if left.loadInfo.LoadRate != right.loadInfo.LoadRate {
@@ -3052,7 +3111,7 @@ func (s *GatewayService) lessWaitCandidate(ctx context.Context, requestedModel s
 	if better, decided := s.antigravityRuntimeBetter(ctx, left.account, right.account); decided {
 		return better
 	}
-	if better, decided := antigravityWarmLastUsedBetter(left.account, right.account); decided {
+	if better, decided := antigravityWarmLoadBetter(left, right); decided {
 		return better
 	}
 	if left.loadInfo.LoadRate != right.loadInfo.LoadRate {
@@ -4336,6 +4395,10 @@ type antigravitySelectionRoundTrace struct {
 	MinPriorityIDs       []int64 `json:"min_priority_ids,omitempty"`
 	DirectPreferredIDs   []int64 `json:"direct_preferred_ids,omitempty"`
 	MinRuntimePenaltyIDs []int64 `json:"min_runtime_penalty_ids,omitempty"`
+	WarmPreference       string  `json:"warm_preference,omitempty"`
+	WarmMinLoadRate      int     `json:"warm_min_load_rate,omitempty"`
+	ColdMinLoadRate      int     `json:"cold_min_load_rate,omitempty"`
+	WarmLoadThreshold    int     `json:"warm_load_threshold,omitempty"`
 	WarmPreferredIDs     []int64 `json:"warm_preferred_ids,omitempty"`
 	MinLoadIDs           []int64 `json:"min_load_ids,omitempty"`
 	SelectedAccountID    int64   `json:"selected_account_id,omitempty"`
