@@ -1,0 +1,8 @@
+interface:
+  display_name: "Sub2API Release"
+  short_description: "Release, monitor, and roll out hcscq/sub2api."
+  brand_color: "#0EA5E9"
+  default_prompt: "Use $sub2api-release to publish a new sub2api tag, monitor the release workflow, and roll the image into /root/sub2api-deploy."
+
+policy:
+  allow_implicit_invocation: true
