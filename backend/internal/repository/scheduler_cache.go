@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -420,19 +421,12 @@ func filterSchedulerExtra(extra map[string]any) map[string]any {
 	if len(extra) == 0 {
 		return nil
 	}
-	keys := []string{
-		"allow_overages",
-		"mixed_scheduling",
-		"window_cost_limit",
-		"window_cost_sticky_reserve",
-		"max_sessions",
-		"session_idle_timeout_minutes",
-	}
 	filtered := make(map[string]any)
-	for _, key := range keys {
-		if value, ok := extra[key]; ok && value != nil {
-			filtered[key] = value
+	for key, value := range extra {
+		if !isSchedulerCriticalExtraKey(key) || value == nil {
+			continue
 		}
+		filtered[key] = value
 	}
 	if modelRateLimits := filterSchedulerModelRateLimits(extra); len(modelRateLimits) > 0 {
 		filtered["model_rate_limits"] = modelRateLimits
@@ -441,6 +435,24 @@ func filterSchedulerExtra(extra map[string]any) map[string]any {
 		return nil
 	}
 	return filtered
+}
+
+func isSchedulerCriticalExtraKey(key string) bool {
+	switch key {
+	case "allow_overages",
+		"mixed_scheduling",
+		"window_cost_limit",
+		"window_cost_sticky_reserve",
+		"max_sessions",
+		"session_idle_timeout_minutes",
+		"antigravity_credits_overages":
+		return true
+	default:
+		if strings.HasPrefix(key, "antigravity_credits_overages:") {
+			return true
+		}
+		return false
+	}
 }
 
 func filterSchedulerModelRateLimits(extra map[string]any) map[string]any {
