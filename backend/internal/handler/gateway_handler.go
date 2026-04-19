@@ -111,6 +111,7 @@ func (h *GatewayHandler) configureFailoverState(fs *FailoverState) {
 	if h == nil || fs == nil || h.cfg == nil {
 		return
 	}
+	fs.SetAntigravityModelCapacitySwitchLimit(h.cfg.Gateway.AntigravityModelCapacitySwitchLimit)
 	fs.SetAntigravityFastFailoverBudget(AntigravityFastFailoverBudget{
 		TotalWindow:       time.Duration(h.cfg.Gateway.AntigravityFastFailoverWindowMs) * time.Millisecond,
 		FastFailThreshold: time.Duration(h.cfg.Gateway.AntigravityFastFailoverThresholdMs) * time.Millisecond,

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"go.uber.org/zap"
@@ -37,9 +38,6 @@ const (
 	// Service 层在 SingleAccountRetry 模式下已做充分原地重试（最多 3 次、总等待 30s），
 	// Handler 层只需短暂间隔后重新进入 Service 层即可。
 	singleAccountBackoffDelay = 2 * time.Second
-	// maxModelCapacitySwitches 多账号 MODEL_CAPACITY_EXHAUSTED 跨账号切换上限。
-	// 容量不足并不总是全池不可用，允许少量切号探测；超过上限后停止放大尾延迟。
-	maxModelCapacitySwitches = 2
 )
 
 // AntigravityFastFailoverBudget 控制 Antigravity 快速 failover 的额外探索窗口。
@@ -57,31 +55,33 @@ func (b AntigravityFastFailoverBudget) enabled() bool {
 
 // FailoverState 跨循环迭代共享的 failover 状态
 type FailoverState struct {
-	SwitchCount           int
-	MaxSwitches           int
-	FailedAccountIDs      map[int64]struct{}
-	SameAccountRetryCount map[int64]int
-	LastFailoverErr       *service.UpstreamFailoverError
-	ForceCacheBilling     bool
-	hasBoundSession       bool
-	singleAccountBackoff  bool
-	modelCapacitySwitches int
-	startedAt             time.Time
-	antigravityBudget     AntigravityFastFailoverBudget
-	antigravityBudgetSeen bool
-	antigravityBudgetFast bool
-	antigravityExtraUsed  int
+	SwitchCount              int
+	MaxSwitches              int
+	FailedAccountIDs         map[int64]struct{}
+	SameAccountRetryCount    map[int64]int
+	LastFailoverErr          *service.UpstreamFailoverError
+	ForceCacheBilling        bool
+	hasBoundSession          bool
+	singleAccountBackoff     bool
+	modelCapacitySwitches    int
+	modelCapacitySwitchLimit int
+	startedAt                time.Time
+	antigravityBudget        AntigravityFastFailoverBudget
+	antigravityBudgetSeen    bool
+	antigravityBudgetFast    bool
+	antigravityExtraUsed     int
 }
 
 // NewFailoverState 创建 failover 状态
 func NewFailoverState(maxSwitches int, hasBoundSession bool) *FailoverState {
 	return &FailoverState{
-		MaxSwitches:           maxSwitches,
-		FailedAccountIDs:      make(map[int64]struct{}),
-		SameAccountRetryCount: make(map[int64]int),
-		hasBoundSession:       hasBoundSession,
-		startedAt:             time.Now(),
-		antigravityBudgetFast: true,
+		MaxSwitches:              maxSwitches,
+		FailedAccountIDs:         make(map[int64]struct{}),
+		SameAccountRetryCount:    make(map[int64]int),
+		hasBoundSession:          hasBoundSession,
+		modelCapacitySwitchLimit: config.DefaultGatewayAntigravityModelCapacitySwitchLimit,
+		startedAt:                time.Now(),
+		antigravityBudgetFast:    true,
 	}
 }
 
@@ -92,6 +92,17 @@ func (s *FailoverState) SetSingleAccountBackoffEnabled(enabled bool) {
 		return
 	}
 	s.singleAccountBackoff = enabled
+}
+
+// SetAntigravityModelCapacitySwitchLimit 配置 Antigravity MODEL_CAPACITY_EXHAUSTED 跨账号切换上限。
+func (s *FailoverState) SetAntigravityModelCapacitySwitchLimit(limit int) {
+	if s == nil {
+		return
+	}
+	if limit <= 0 {
+		limit = config.DefaultGatewayAntigravityModelCapacitySwitchLimit
+	}
+	s.modelCapacitySwitchLimit = limit
 }
 
 // SetAntigravityFastFailoverBudget 配置 Antigravity 快速 failover 的额外时间预算。
@@ -146,10 +157,10 @@ func (s *FailoverState) HandleFailoverErrorWithDuration(
 			s.FailedAccountIDs[accountID] = struct{}{}
 			s.observeAntigravityBudget(platform, failoverErr, attemptDuration)
 			allowExtraSwitch := false
-			if s.modelCapacitySwitches >= maxModelCapacitySwitches || s.SwitchCount >= s.MaxSwitches {
+			if s.modelCapacitySwitches >= s.modelCapacitySwitchLimit || s.SwitchCount >= s.MaxSwitches {
 				allowExtraSwitch = s.tryUseAntigravityExtraSwitch(ctx, failoverErr, attemptDuration, "model_capacity")
 			}
-			if !allowExtraSwitch && (s.modelCapacitySwitches >= maxModelCapacitySwitches || s.SwitchCount >= s.MaxSwitches) {
+			if !allowExtraSwitch && (s.modelCapacitySwitches >= s.modelCapacitySwitchLimit || s.SwitchCount >= s.MaxSwitches) {
 				return FailoverExhausted
 			}
 			s.modelCapacitySwitches++
@@ -157,7 +168,7 @@ func (s *FailoverState) HandleFailoverErrorWithDuration(
 			logger.FromContext(ctx).Warn("gateway.failover_model_capacity_switch_account",
 				zap.Int64("account_id", accountID),
 				zap.Int("model_capacity_switch_count", s.modelCapacitySwitches),
-				zap.Int("model_capacity_switch_max", maxModelCapacitySwitches),
+				zap.Int("model_capacity_switch_max", s.modelCapacitySwitchLimit),
 				zap.Int("switch_count", s.SwitchCount),
 				zap.Int("max_switches", s.MaxSwitches),
 			)
@@ -342,7 +353,7 @@ func (s *FailoverState) canRecycleAntigravityCandidates() bool {
 		return false
 	}
 	if s.LastFailoverErr.ModelCapacityExhausted &&
-		s.modelCapacitySwitches >= maxModelCapacitySwitches &&
+		s.modelCapacitySwitches >= s.modelCapacitySwitchLimit &&
 		s.antigravityExtraUsed >= s.antigravityBudget.MaxExtraSwitches {
 		return false
 	}

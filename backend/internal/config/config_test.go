@@ -78,6 +78,37 @@ func TestLoadDefaultSchedulingConfig(t *testing.T) {
 	}
 }
 
+func TestLoadDefaultAntigravityModelCapacitySwitchLimit(t *testing.T) {
+	resetViperWithJWTSecret(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	if cfg.Gateway.AntigravityModelCapacitySwitchLimit != DefaultGatewayAntigravityModelCapacitySwitchLimit {
+		t.Fatalf(
+			"Gateway.AntigravityModelCapacitySwitchLimit = %d, want %d",
+			cfg.Gateway.AntigravityModelCapacitySwitchLimit,
+			DefaultGatewayAntigravityModelCapacitySwitchLimit,
+		)
+	}
+}
+
+func TestLoadAntigravityModelCapacitySwitchLimitFromEnv(t *testing.T) {
+	resetViperWithJWTSecret(t)
+	t.Setenv("GATEWAY_ANTIGRAVITY_MODEL_CAPACITY_SWITCH_LIMIT", "6")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	if cfg.Gateway.AntigravityModelCapacitySwitchLimit != 6 {
+		t.Fatalf("Gateway.AntigravityModelCapacitySwitchLimit = %d, want 6", cfg.Gateway.AntigravityModelCapacitySwitchLimit)
+	}
+}
+
 func TestLoadDefaultOpenAIWSConfig(t *testing.T) {
 	resetViperWithJWTSecret(t)
 

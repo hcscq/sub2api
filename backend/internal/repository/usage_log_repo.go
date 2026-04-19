@@ -2076,6 +2076,54 @@ func (r *usageLogRepository) GetAccountWindowStatsBatch(ctx context.Context, acc
 	return result, nil
 }
 
+// GetAccountRecentSuccessStatsBatch 批量获取账号最近成功情况。
+// recent_success_count 统计 since 之后的成功次数；last_success_at 为最近一次成功时间。
+func (r *usageLogRepository) GetAccountRecentSuccessStatsBatch(ctx context.Context, accountIDs []int64, since time.Time) (map[int64]*service.RecentSuccessStats, error) {
+	result := make(map[int64]*service.RecentSuccessStats, len(accountIDs))
+	if len(accountIDs) == 0 {
+		return result, nil
+	}
+
+	query := `
+		SELECT
+			account_id,
+			COUNT(*) FILTER (WHERE created_at >= $2) AS recent_success_count,
+			MAX(created_at) AS last_success_at
+		FROM usage_logs
+		WHERE account_id = ANY($1)
+		GROUP BY account_id
+	`
+	rows, err := r.sql.QueryContext(ctx, query, pq.Array(accountIDs), since)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var accountID int64
+		var stats service.RecentSuccessStats
+		var lastSuccessAt sql.NullTime
+		if err := rows.Scan(&accountID, &stats.RecentSuccessCount, &lastSuccessAt); err != nil {
+			return nil, err
+		}
+		if lastSuccessAt.Valid {
+			t := lastSuccessAt.Time
+			stats.LastSuccessAt = &t
+		}
+		result[accountID] = &stats
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	for _, accountID := range accountIDs {
+		if _, ok := result[accountID]; !ok {
+			result[accountID] = &service.RecentSuccessStats{}
+		}
+	}
+	return result, nil
+}
+
 // GetGeminiUsageTotalsBatch 批量聚合 Gemini 账号在窗口内的 Pro/Flash 请求与用量。
 // 模型分类规则与 service.geminiModelClassFromName 一致：model 包含 flash/lite 视为 flash，其余视为 pro。
 func (r *usageLogRepository) GetGeminiUsageTotalsBatch(ctx context.Context, accountIDs []int64, startTime, endTime time.Time) (map[int64]service.GeminiUsageTotals, error) {

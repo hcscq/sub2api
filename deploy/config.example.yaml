@@ -197,6 +197,9 @@ gateway:
   # - account_proxy: Isolate by account+proxy combination (default, finest granularity)
   # - account_proxy: 按账户+代理组合隔离（默认，最细粒度）
   connection_pool_isolation: "account_proxy"
+  # Max cross-account switches for Antigravity MODEL_CAPACITY_EXHAUSTED before failover stops.
+  # Antigravity MODEL_CAPACITY_EXHAUSTED 跨账号切换上限，避免过早判定整池不可用。
+  antigravity_model_capacity_switch_limit: 4
   # Force Codex CLI mode: treat all /openai/v1/responses requests as Codex CLI.
   # 强制按 Codex CLI 处理 /openai/v1/responses 请求（用于网关未透传/改写 User-Agent 的兜底）。
   #

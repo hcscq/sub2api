@@ -83,6 +83,10 @@ type accountWindowStatsBatchReader interface {
 	GetAccountWindowStatsBatch(ctx context.Context, accountIDs []int64, startTime time.Time) (map[int64]*usagestats.AccountStats, error)
 }
 
+type accountRecentSuccessStatsBatchReader interface {
+	GetAccountRecentSuccessStatsBatch(ctx context.Context, accountIDs []int64, since time.Time) (map[int64]*RecentSuccessStats, error)
+}
+
 // apiUsageCache 缓存从 Anthropic API 获取的使用率数据（utilization, resets_at）
 // 同时支持缓存错误响应（负缓存），防止 429 等错误导致的重试风暴
 type apiUsageCache struct {
@@ -139,6 +143,12 @@ type WindowStats struct {
 	Cost         float64 `json:"cost"`
 	StandardCost float64 `json:"standard_cost"`
 	UserCost     float64 `json:"user_cost"`
+}
+
+// RecentSuccessStats is a runtime view of whether an account has succeeded recently.
+type RecentSuccessStats struct {
+	LastSuccessAt      *time.Time `json:"last_success_at,omitempty"`
+	RecentSuccessCount int        `json:"recent_success_count"`
 }
 
 // UsageProgress 使用量进度
@@ -1063,6 +1073,47 @@ func (s *AccountUsageService) GetTodayStatsBatch(ctx context.Context, accountIDs
 	for _, accountID := range uniqueIDs {
 		if _, ok := result[accountID]; !ok {
 			result[accountID] = &WindowStats{}
+		}
+	}
+	return result, nil
+}
+
+// GetRecentSuccessStatsBatch 批量获取账号最近成功情况。
+// RecentSuccessCount 统计 since 之后的 usage_logs 成功次数；LastSuccessAt 为最近一次成功时间。
+func (s *AccountUsageService) GetRecentSuccessStatsBatch(ctx context.Context, accountIDs []int64, since time.Time) (map[int64]*RecentSuccessStats, error) {
+	uniqueIDs := make([]int64, 0, len(accountIDs))
+	seen := make(map[int64]struct{}, len(accountIDs))
+	for _, accountID := range accountIDs {
+		if accountID <= 0 {
+			continue
+		}
+		if _, exists := seen[accountID]; exists {
+			continue
+		}
+		seen[accountID] = struct{}{}
+		uniqueIDs = append(uniqueIDs, accountID)
+	}
+
+	result := make(map[int64]*RecentSuccessStats, len(uniqueIDs))
+	for _, accountID := range uniqueIDs {
+		result[accountID] = &RecentSuccessStats{}
+	}
+	if len(uniqueIDs) == 0 || s.usageLogRepo == nil {
+		return result, nil
+	}
+
+	batchReader, ok := s.usageLogRepo.(accountRecentSuccessStatsBatchReader)
+	if !ok {
+		return result, nil
+	}
+
+	statsByAccount, err := batchReader.GetAccountRecentSuccessStatsBatch(ctx, uniqueIDs, since)
+	if err != nil {
+		return nil, err
+	}
+	for _, accountID := range uniqueIDs {
+		if stats, exists := statsByAccount[accountID]; exists && stats != nil {
+			result[accountID] = stats
 		}
 	}
 	return result, nil

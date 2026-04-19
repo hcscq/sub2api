@@ -2146,6 +2146,7 @@ export default {
         weight: 'Weight',
         status: 'Status',
         schedulable: 'Schedulable',
+        recentSuccess: 'Recent Success',
         todayStats: 'Today Stats',
         groups: 'Groups',
         usageWindows: 'Usage Windows',
@@ -2153,6 +2154,10 @@ export default {
         lastUsed: 'Last Used',
         expiresAt: 'Expires At',
         actions: 'Actions'
+      },
+      recentSuccess: {
+        windowLabel: 'Last {minutes}m',
+        lastLabel: 'Last success'
       },
       allPrivacyModes: 'All Privacy States',
       privacyUnset: 'Unset',

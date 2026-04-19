@@ -166,7 +166,18 @@ type AccountWithConcurrency struct {
 	CurrentRPM        *int     `json:"current_rpm,omitempty"`         // 当前分钟 RPM 计数
 }
 
-const accountListGroupUngroupedQueryValue = "ungrouped"
+const (
+	accountListGroupUngroupedQueryValue = "ungrouped"
+	accountRecentSuccessWindow          = 15 * time.Minute
+)
+
+func applyRecentSuccessStats(account *dto.Account, stats *service.RecentSuccessStats) {
+	if account == nil || stats == nil {
+		return
+	}
+	account.LastSuccessAt = stats.LastSuccessAt
+	account.RecentSuccessCount = stats.RecentSuccessCount
+}
 
 func (h *AccountHandler) buildAccountResponseWithRuntime(ctx context.Context, account *service.Account) AccountWithConcurrency {
 	item := AccountWithConcurrency{
@@ -180,6 +191,11 @@ func (h *AccountHandler) buildAccountResponseWithRuntime(ctx context.Context, ac
 	if h.concurrencyService != nil {
 		if counts, err := h.concurrencyService.GetAccountConcurrencyBatch(ctx, []int64{account.ID}); err == nil {
 			item.CurrentConcurrency = counts[account.ID]
+		}
+	}
+	if h.accountUsageService != nil {
+		if stats, err := h.accountUsageService.GetRecentSuccessStatsBatch(ctx, []int64{account.ID}, time.Now().Add(-accountRecentSuccessWindow)); err == nil {
+			applyRecentSuccessStats(item.Account, stats[account.ID])
 		}
 	}
 
@@ -261,6 +277,7 @@ func (h *AccountHandler) List(c *gin.Context) {
 	}
 
 	concurrencyCounts := make(map[int64]int)
+	recentSuccessStats := make(map[int64]*service.RecentSuccessStats)
 	var windowCosts map[int64]float64
 	var activeSessions map[int64]int
 	var rpmCounts map[int64]int
@@ -269,6 +286,11 @@ func (h *AccountHandler) List(c *gin.Context) {
 	if h.concurrencyService != nil {
 		if cc, ccErr := h.concurrencyService.GetAccountConcurrencyBatch(c.Request.Context(), accountIDs); ccErr == nil && cc != nil {
 			concurrencyCounts = cc
+		}
+	}
+	if h.accountUsageService != nil && len(accountIDs) > 0 {
+		if stats, statsErr := h.accountUsageService.GetRecentSuccessStatsBatch(c.Request.Context(), accountIDs, time.Now().Add(-accountRecentSuccessWindow)); statsErr == nil && stats != nil {
+			recentSuccessStats = stats
 		}
 	}
 
@@ -345,6 +367,7 @@ func (h *AccountHandler) List(c *gin.Context) {
 			Account:            dto.AccountFromService(acc),
 			CurrentConcurrency: concurrencyCounts[acc.ID],
 		}
+		applyRecentSuccessStats(item.Account, recentSuccessStats[acc.ID])
 
 		// 添加窗口费用（仅当启用时）
 		if windowCosts != nil {

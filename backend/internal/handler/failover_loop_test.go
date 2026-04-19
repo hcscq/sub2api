@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 
 	"github.com/stretchr/testify/require"
@@ -58,6 +59,7 @@ func TestNewFailoverState(t *testing.T) {
 		require.True(t, fs.hasBoundSession)
 		require.False(t, fs.singleAccountBackoff)
 		require.Zero(t, fs.modelCapacitySwitches)
+		require.Equal(t, config.DefaultGatewayAntigravityModelCapacitySwitchLimit, fs.modelCapacitySwitchLimit)
 	})
 
 	t.Run("无绑定会话", func(t *testing.T) {
@@ -75,6 +77,15 @@ func TestNewFailoverState(t *testing.T) {
 		fs := NewFailoverState(3, false)
 		fs.SetSingleAccountBackoffEnabled(true)
 		require.True(t, fs.singleAccountBackoff)
+	})
+
+	t.Run("可配置模型容量切号上限", func(t *testing.T) {
+		fs := NewFailoverState(3, false)
+		fs.SetAntigravityModelCapacitySwitchLimit(6)
+		require.Equal(t, 6, fs.modelCapacitySwitchLimit)
+
+		fs.SetAntigravityModelCapacitySwitchLimit(0)
+		require.Equal(t, config.DefaultGatewayAntigravityModelCapacitySwitchLimit, fs.modelCapacitySwitchLimit)
 	})
 }
 
@@ -264,9 +275,10 @@ func TestHandleFailoverError_BasicSwitch(t *testing.T) {
 	t.Run("MODEL_CAPACITY_EXHAUSTED 跨账号切换超过上限后直接Exhausted", func(t *testing.T) {
 		mock := &mockTempUnscheduler{}
 		fs := NewFailoverState(5, false)
+		fs.SetAntigravityModelCapacitySwitchLimit(2)
 		fs.SwitchCount = 1
 		fs.FailedAccountIDs[55] = struct{}{}
-		fs.modelCapacitySwitches = maxModelCapacitySwitches
+		fs.modelCapacitySwitches = fs.modelCapacitySwitchLimit
 		err := newTestFailoverErr(503, false, false)
 		err.ModelCapacityExhausted = true
 
@@ -279,7 +291,7 @@ func TestHandleFailoverError_BasicSwitch(t *testing.T) {
 		require.Len(t, fs.FailedAccountIDs, 2)
 		require.Contains(t, fs.FailedAccountIDs, int64(55))
 		require.Contains(t, fs.FailedAccountIDs, int64(100))
-		require.Equal(t, maxModelCapacitySwitches, fs.modelCapacitySwitches)
+		require.Equal(t, fs.modelCapacitySwitchLimit, fs.modelCapacitySwitches)
 		require.Less(t, elapsed, 200*time.Millisecond, "模型容量切换次数用尽后应立即结束")
 	})
 }
@@ -854,14 +866,15 @@ func TestHandleFailoverErrorWithDuration_ModelCapacityBudgetAllowsExtraSwitch(t 
 		FastFailThreshold: 50 * time.Millisecond,
 		MaxExtraSwitches:  2,
 	})
-	fs.modelCapacitySwitches = maxModelCapacitySwitches
+	fs.SetAntigravityModelCapacitySwitchLimit(2)
+	fs.modelCapacitySwitches = fs.modelCapacitySwitchLimit
 
 	err := newTestFailoverErr(503, false, false)
 	err.ModelCapacityExhausted = true
 
 	action := fs.HandleFailoverErrorWithDuration(context.Background(), mock, 300, service.PlatformAntigravity, err, 10*time.Millisecond)
 	require.Equal(t, FailoverContinue, action)
-	require.Equal(t, maxModelCapacitySwitches+1, fs.modelCapacitySwitches)
+	require.Equal(t, fs.modelCapacitySwitchLimit+1, fs.modelCapacitySwitches)
 	require.Equal(t, 1, fs.SwitchCount)
 	require.Equal(t, 1, fs.antigravityExtraUsed)
 }

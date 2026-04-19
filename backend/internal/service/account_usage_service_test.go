@@ -5,7 +5,70 @@ import (
 	"net/http"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
+
+type recentSuccessBatchRepoStub struct {
+	UsageLogRepository
+
+	batchResult map[int64]*RecentSuccessStats
+	batchErr    error
+	batchCalls  int
+}
+
+func (s *recentSuccessBatchRepoStub) GetAccountRecentSuccessStatsBatch(ctx context.Context, accountIDs []int64, since time.Time) (map[int64]*RecentSuccessStats, error) {
+	s.batchCalls++
+	if s.batchErr != nil {
+		return nil, s.batchErr
+	}
+	out := make(map[int64]*RecentSuccessStats, len(accountIDs))
+	for _, id := range accountIDs {
+		if stats, ok := s.batchResult[id]; ok {
+			out[id] = stats
+		}
+	}
+	return out, nil
+}
+
+func TestAccountUsageService_GetRecentSuccessStatsBatch(t *testing.T) {
+	t.Parallel()
+
+	t.Run("uses batch reader and fills zero values", func(t *testing.T) {
+		lastSuccess := time.Date(2026, 4, 19, 8, 1, 2, 0, time.UTC)
+		repo := &recentSuccessBatchRepoStub{
+			batchResult: map[int64]*RecentSuccessStats{
+				101: {
+					LastSuccessAt:      &lastSuccess,
+					RecentSuccessCount: 3,
+				},
+			},
+		}
+		svc := &AccountUsageService{usageLogRepo: repo}
+
+		stats, err := svc.GetRecentSuccessStatsBatch(context.Background(), []int64{101, 101, 202}, time.Now().Add(-15*time.Minute))
+		require.NoError(t, err)
+		require.Equal(t, 1, repo.batchCalls)
+		require.Len(t, stats, 2)
+		require.Equal(t, 3, stats[101].RecentSuccessCount)
+		require.NotNil(t, stats[101].LastSuccessAt)
+		require.Equal(t, lastSuccess, *stats[101].LastSuccessAt)
+		require.Zero(t, stats[202].RecentSuccessCount)
+		require.Nil(t, stats[202].LastSuccessAt)
+	})
+
+	t.Run("missing batch reader returns zero values", func(t *testing.T) {
+		svc := &AccountUsageService{}
+
+		stats, err := svc.GetRecentSuccessStatsBatch(context.Background(), []int64{301, 302}, time.Now().Add(-15*time.Minute))
+		require.NoError(t, err)
+		require.Len(t, stats, 2)
+		require.Zero(t, stats[301].RecentSuccessCount)
+		require.Nil(t, stats[301].LastSuccessAt)
+		require.Zero(t, stats[302].RecentSuccessCount)
+		require.Nil(t, stats[302].LastSuccessAt)
+	})
+}
 
 type accountUsageCodexProbeRepo struct {
 	stubOpenAIAccountRepo

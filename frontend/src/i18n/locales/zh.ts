@@ -2187,6 +2187,7 @@ export default {
         weight: '权重',
         status: '状态',
         schedulable: '调度',
+        recentSuccess: '近期成功',
         todayStats: '今日统计',
         groups: '分组',
         usageWindows: '用量窗口',
@@ -2194,6 +2195,10 @@ export default {
         lastUsed: '最近使用',
         expiresAt: '过期时间',
         actions: '操作'
+      },
+      recentSuccess: {
+        windowLabel: '近 {minutes} 分钟',
+        lastLabel: '最近成功'
       },
       allPrivacyModes: '全部Privacy状态',
       privacyUnset: '未设置',

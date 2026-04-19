@@ -17,6 +17,9 @@ import (
 const (
 	RunModeStandard = "standard"
 	RunModeSimple   = "simple"
+	// DefaultGatewayAntigravityModelCapacitySwitchLimit controls how many cross-account
+	// switches Antigravity MODEL_CAPACITY_EXHAUSTED can trigger before failover stops.
+	DefaultGatewayAntigravityModelCapacitySwitchLimit = 4
 )
 
 // 使用量记录队列溢出策略
@@ -407,6 +410,8 @@ type GatewayConfig struct {
 	MaxAccountSwitches int `mapstructure:"max_account_switches"`
 	// Gemini 账户切换最大次数（Gemini 平台单独配置，因 API 限制更严格）
 	MaxAccountSwitchesGemini int `mapstructure:"max_account_switches_gemini"`
+	// Antigravity MODEL_CAPACITY_EXHAUSTED 跨账号切换上限
+	AntigravityModelCapacitySwitchLimit int `mapstructure:"antigravity_model_capacity_switch_limit"`
 
 	// Antigravity 快速 failover 总时间预算（毫秒）
 	// 当多次切号都在该窗口内快速失败时，允许继续探索更多凭据/循环重试。
@@ -1420,6 +1425,7 @@ func setDefaults() {
 	viper.SetDefault("gateway.openai_ws.scheduler_score_weights.ttft", 0.5)
 	viper.SetDefault("gateway.antigravity_fallback_cooldown_minutes", 1)
 	viper.SetDefault("gateway.antigravity_extra_retries", 10)
+	viper.SetDefault("gateway.antigravity_model_capacity_switch_limit", DefaultGatewayAntigravityModelCapacitySwitchLimit)
 	viper.SetDefault("gateway.max_body_size", int64(256*1024*1024))
 	viper.SetDefault("gateway.upstream_response_read_max_bytes", int64(8*1024*1024))
 	viper.SetDefault("gateway.proxy_probe_response_read_max_bytes", int64(1024*1024))
