@@ -116,6 +116,8 @@ func TestGatewayHandlerAcquireWaitPlannedAccountSlot_CountsQueueAndBindsStickySe
 	sessionHash := "sticky-session"
 	account := &service.Account{
 		ID:          1001,
+		Status:      service.StatusActive,
+		Schedulable: true,
 		Concurrency: 1,
 	}
 	waitPlan := &service.AccountWaitPlan{
@@ -131,6 +133,7 @@ func TestGatewayHandlerAcquireWaitPlannedAccountSlot_CountsQueueAndBindsStickySe
 		&groupID,
 		sessionHash,
 		account,
+		"gpt-4.1",
 		waitPlan,
 		false,
 		&streamStarted,
@@ -146,6 +149,100 @@ func TestGatewayHandlerAcquireWaitPlannedAccountSlot_CountsQueueAndBindsStickySe
 	require.Equal(t, account.ID, concurrencyCache.lastWaitAccountID)
 	require.Equal(t, waitPlan.MaxWaiting, concurrencyCache.lastMaxWaiting)
 	require.Equal(t, account.ID, stickyCache.sessionBindings[sessionHash])
+
+	releaseFunc()
+	require.Equal(t, 1, concurrencyCache.accountReleaseCalls)
+}
+
+func TestGatewayHandlerAcquireWaitPlannedAccountSlot_SkipsStickyForAntigravityCreditsFallback(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	concurrencyCache := &accountWaitTrackingCache{
+		helperConcurrencyCacheStub: helperConcurrencyCacheStub{
+			accountSeq: []bool{false, true},
+		},
+	}
+	concurrencySvc := service.NewConcurrencyService(concurrencyCache)
+
+	stickyCache := &gatewayStickyCacheStub{sessionBindings: make(map[string]int64)}
+	gatewaySvc := service.NewGatewayService(
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		stickyCache,
+		nil,
+		nil,
+		concurrencySvc,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+	)
+
+	h := &GatewayHandler{
+		gatewayService:    gatewaySvc,
+		concurrencyHelper: NewConcurrencyHelper(concurrencySvc, SSEPingFormatClaude, 0),
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	groupID := int64(42)
+	sessionHash := "sticky-session"
+	account := &service.Account{
+		ID:          1002,
+		Platform:    service.PlatformAntigravity,
+		Status:      service.StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Extra: map[string]any{
+			"allow_overages": true,
+			"antigravity_credits_overages:claude-sonnet-4-6": map[string]any{
+				"active_until": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+			},
+		},
+	}
+	waitPlan := &service.AccountWaitPlan{
+		AccountID:      account.ID,
+		MaxConcurrency: account.Concurrency,
+		Timeout:        time.Second,
+		MaxWaiting:     3,
+	}
+	streamStarted := false
+
+	releaseFunc, queueFull, err := h.acquireWaitPlannedAccountSlot(
+		c,
+		&groupID,
+		sessionHash,
+		account,
+		"claude-sonnet-4-6",
+		waitPlan,
+		false,
+		&streamStarted,
+		zap.NewNop(),
+		"gateway.cc",
+	)
+
+	require.NoError(t, err)
+	require.False(t, queueFull)
+	require.NotNil(t, releaseFunc)
+	require.NotContains(t, stickyCache.sessionBindings, sessionHash)
 
 	releaseFunc()
 	require.Equal(t, 1, concurrencyCache.accountReleaseCalls)

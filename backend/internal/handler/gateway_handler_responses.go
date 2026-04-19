@@ -203,6 +203,7 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 				apiKey.GroupID,
 				sessionHash,
 				account,
+				reqModel,
 				selection.WaitPlan,
 				reqStream,
 				&streamStarted,

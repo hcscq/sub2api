@@ -13,6 +13,7 @@ func (h *GatewayHandler) acquireWaitPlannedAccountSlot(
 	groupID *int64,
 	sessionHash string,
 	account *service.Account,
+	requestedModel string,
 	waitPlan *service.AccountWaitPlan,
 	reqStream bool,
 	streamStarted *bool,
@@ -62,8 +63,10 @@ func (h *GatewayHandler) acquireWaitPlannedAccountSlot(
 	// Slot acquired: no longer waiting in queue.
 	releaseWait()
 	if h.gatewayService != nil {
-		if err := h.gatewayService.BindStickySession(ctx, groupID, sessionHash, account.ID); err != nil {
-			reqLog.Warn(logPrefix+".bind_sticky_session_failed", zap.Int64("account_id", account.ID), zap.Error(err))
+		if h.gatewayService.ShouldBindStickySession(account, requestedModel) {
+			if err := h.gatewayService.BindStickySession(ctx, groupID, sessionHash, account.ID); err != nil {
+				reqLog.Warn(logPrefix+".bind_sticky_session_failed", zap.Int64("account_id", account.ID), zap.Error(err))
+			}
 		}
 	}
 	return accountReleaseFunc, false, nil

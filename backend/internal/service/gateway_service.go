@@ -830,6 +830,15 @@ func (s *GatewayService) BindStickySession(ctx context.Context, groupID *int64, 
 	return s.cache.SetSessionAccountID(ctx, derefGroupID(groupID), sessionHash, accountID, stickySessionTTL)
 }
 
+// ShouldBindStickySession reports whether the selected account should establish
+// a new sticky-session binding for the requested model.
+func (s *GatewayService) ShouldBindStickySession(account *Account, requestedModel string) bool {
+	if account == nil {
+		return false
+	}
+	return !shouldClearStickySession(account, requestedModel)
+}
+
 // GetCachedSessionAccountID retrieves the account ID bound to a sticky session.
 // Returns 0 if no binding exists or on error.
 func (s *GatewayService) GetCachedSessionAccountID(ctx context.Context, groupID *int64, sessionHash string) (int64, error) {
