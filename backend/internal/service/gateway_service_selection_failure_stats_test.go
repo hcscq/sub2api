@@ -139,3 +139,141 @@ func TestDiagnoseSelectionFailure_ModelRateLimitedDetail(t *testing.T) {
 		t.Fatalf("detail=%s want contains remaining=", diagnosis.Detail)
 	}
 }
+
+func TestBuildAntigravitySelectionTraceCandidates(t *testing.T) {
+	svc := &GatewayService{}
+	ctx := context.Background()
+	model := "claude-opus-4-6"
+	now := time.Now().UTC()
+
+	direct := Account{
+		ID:          397,
+		Platform:    PlatformAntigravity,
+		Status:      StatusActive,
+		Schedulable: true,
+		Priority:    1,
+		LastUsedAt:  &now,
+	}
+
+	creditsFallback := Account{
+		ID:          425,
+		Platform:    PlatformAntigravity,
+		Status:      StatusActive,
+		Schedulable: true,
+		Priority:    1,
+		Extra: map[string]any{
+			"allow_overages": true,
+		},
+	}
+	creditsFallback.Extra[buildAntigravityCreditsOveragesExtraKey(resolveCreditsOveragesModelKey(ctx, &creditsFallback, "", model))] = map[string]any{
+		"active_until": now.Add(30 * time.Minute).Format(time.RFC3339),
+	}
+
+	modelLimited := Account{
+		ID:          421,
+		Platform:    PlatformAntigravity,
+		Status:      StatusActive,
+		Schedulable: true,
+		Priority:    1,
+		Extra: map[string]any{
+			modelRateLimitsKey: map[string]any{
+				resolveFinalAntigravityModelKey(ctx, &direct, model): map[string]any{
+					"rate_limit_reset_at": now.Add(30 * time.Minute).Format(time.RFC3339),
+				},
+			},
+		},
+	}
+
+	excluded := Account{
+		ID:          429,
+		Platform:    PlatformAntigravity,
+		Status:      StatusActive,
+		Schedulable: true,
+		Priority:    1,
+	}
+
+	items := svc.buildAntigravitySelectionTraceCandidates(
+		ctx,
+		[]Account{direct, creditsFallback, modelLimited, excluded},
+		model,
+		map[int64]struct{}{429: {}},
+	)
+
+	if len(items) != 4 {
+		t.Fatalf("len(items)=%d want=4", len(items))
+	}
+
+	byID := make(map[int64]antigravitySelectionCandidateTrace, len(items))
+	for _, item := range items {
+		byID[item.AccountID] = item
+	}
+
+	if byID[397].Mode != "direct" || byID[397].Status != "eligible" {
+		t.Fatalf("direct trace=%+v want mode=direct status=eligible", byID[397])
+	}
+	if byID[425].Mode != "credits_fallback" || byID[425].Status != "eligible" {
+		t.Fatalf("fallback trace=%+v want mode=credits_fallback status=eligible", byID[425])
+	}
+	if byID[421].Reason != "model_rate_limited" || byID[421].Status != "filtered" {
+		t.Fatalf("model-limited trace=%+v want filtered model_rate_limited", byID[421])
+	}
+	if byID[429].Reason != "excluded" || byID[429].Status != "filtered" {
+		t.Fatalf("excluded trace=%+v want filtered excluded", byID[429])
+	}
+}
+
+func TestAnnotateAntigravitySelectionTraceCandidates(t *testing.T) {
+	items := []antigravitySelectionCandidateTrace{
+		{AccountID: 397, Mode: "direct", Status: "eligible"},
+		{AccountID: 425, Mode: "credits_fallback", Status: "eligible"},
+		{AccountID: 429, Mode: "credits_fallback", Status: "eligible"},
+	}
+
+	available := []accountWithLoad{
+		{
+			account: &Account{ID: 397},
+			loadInfo: &AccountLoadInfo{
+				AccountID:          397,
+				CurrentConcurrency: 0,
+				WaitingCount:       0,
+				LoadRate:           5,
+			},
+		},
+		{
+			account: &Account{ID: 425},
+			loadInfo: &AccountLoadInfo{
+				AccountID:          425,
+				CurrentConcurrency: 0,
+				WaitingCount:       0,
+				LoadRate:           7,
+			},
+		},
+	}
+	waitCandidates := []accountWithLoad{
+		{
+			account: &Account{ID: 429},
+			loadInfo: &AccountLoadInfo{
+				AccountID:          429,
+				CurrentConcurrency: 1,
+				WaitingCount:       2,
+				LoadRate:           100,
+			},
+		},
+	}
+
+	annotated := annotateAntigravitySelectionTraceCandidates(items, available, waitCandidates, 397, "immediate", []int64{397, 425})
+	byID := make(map[int64]antigravitySelectionCandidateTrace, len(annotated))
+	for _, item := range annotated {
+		byID[item.AccountID] = item
+	}
+
+	if byID[397].Status != "selected" || byID[397].LoadRate != 5 {
+		t.Fatalf("selected trace=%+v want status=selected load_rate=5", byID[397])
+	}
+	if byID[425].Status != "immediate_candidate" || byID[425].LoadRate != 7 {
+		t.Fatalf("immediate trace=%+v want status=immediate_candidate load_rate=7", byID[425])
+	}
+	if byID[429].Status != "wait_candidate" || byID[429].WaitingCount != 2 {
+		t.Fatalf("wait trace=%+v want status=wait_candidate waiting_count=2", byID[429])
+	}
+}

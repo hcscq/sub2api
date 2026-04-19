@@ -36,6 +36,7 @@ import (
 	gocache "github.com/patrickmn/go-cache"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+	"go.uber.org/zap"
 	"golang.org/x/sync/singleflight"
 
 	"github.com/gin-gonic/gin"
@@ -1462,6 +1463,10 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 	}
 	ctx = s.withWindowCostPrefetch(ctx, accounts)
 	ctx = s.withRPMPrefetch(ctx, accounts)
+	var antigravityTraceCandidates []antigravitySelectionCandidateTrace
+	if platform == PlatformAntigravity {
+		antigravityTraceCandidates = s.buildAntigravitySelectionTraceCandidates(ctx, accounts, requestedModel, excludedIDs)
+	}
 
 	// 提前构建 accountByID（供 Layer 1 和 Layer 1.5 使用）
 	accountByID := make(map[int64]*Account, len(accounts))
@@ -1586,6 +1591,25 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 									if s.debugModelRoutingEnabled() {
 										logger.LegacyPrintf("service.gateway", "[ModelRoutingDebug] routed sticky hit: group_id=%v model=%s session=%s account=%d", derefGroupID(groupID), requestedModel, shortSessionHash(sessionHash), stickyAccountID)
 									}
+									if platform == PlatformAntigravity {
+										s.logAntigravitySelectionTrace(ctx, groupID, sessionHash, requestedModel, antigravitySelectionTrace{
+											Flow:              "load_aware",
+											Scope:             "routed",
+											ScopeAccountIDs:   append([]int64(nil), routingAccountIDs...),
+											StickyAccountID:   stickyAccountID,
+											SelectedSource:    "immediate",
+											SelectedAccountID: stickyAccountID,
+											SelectedMode:      antigravitySelectionModeLabel(s.antigravityModelSelectionMode(ctx, stickyAccount, requestedModel)),
+											Candidates: annotateAntigravitySelectionTraceCandidates(
+												append([]antigravitySelectionCandidateTrace(nil), antigravityTraceCandidates...),
+												nil,
+												nil,
+												stickyAccountID,
+												"immediate",
+												nil,
+											),
+										})
+									}
 									return s.newSelectionResult(ctx, stickyAccount, true, result.ReleaseFunc, nil)
 								}
 							}
@@ -1599,6 +1623,26 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 											stickyCacheMissReason = "session_limit"
 											// 会话限制已满，继续到负载感知选择
 										} else {
+											if platform == PlatformAntigravity {
+												s.logAntigravitySelectionTrace(ctx, groupID, sessionHash, requestedModel, antigravitySelectionTrace{
+													Flow:              "load_aware",
+													Scope:             "routed",
+													ScopeAccountIDs:   append([]int64(nil), routingAccountIDs...),
+													StickyAccountID:   stickyAccountID,
+													SelectedSource:    "wait_plan",
+													SelectedAccountID: stickyAccountID,
+													SelectedMode:      antigravitySelectionModeLabel(s.antigravityModelSelectionMode(ctx, stickyAccount, requestedModel)),
+													WaitOrderIDs:      []int64{stickyAccountID},
+													Candidates: annotateAntigravitySelectionTraceCandidates(
+														append([]antigravitySelectionCandidateTrace(nil), antigravityTraceCandidates...),
+														nil,
+														nil,
+														stickyAccountID,
+														"wait_plan",
+														nil,
+													),
+												})
+											}
 											return &AccountSelectionResult{
 												Account: stickyAccount,
 												WaitPlan: &AccountWaitPlan{
@@ -1651,13 +1695,18 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 
 			// 3. 按负载感知排序
 			var routingAvailable []accountWithLoad
+			routingWaitCandidates := make([]accountWithLoad, 0, len(routingCandidates))
 			for _, acc := range routingCandidates {
 				loadInfo := loadInfoOrDefault(routingLoadMap, acc.ID)
+				item := accountWithLoad{account: acc, loadInfo: loadInfo}
+				routingWaitCandidates = append(routingWaitCandidates, item)
 				// WaitingCount 会放大 LoadRate；是否还能立即抢到真实并发槽位，必须看当前占用数。
 				if hasImmediateConcurrencyCapacity(loadInfo, acc.EffectiveLoadFactor()) {
-					routingAvailable = append(routingAvailable, accountWithLoad{account: acc, loadInfo: loadInfo})
+					routingAvailable = append(routingAvailable, item)
 				}
 			}
+			initialRoutingAvailable := append([]accountWithLoad(nil), routingAvailable...)
+			initialRoutingWaitCandidates := append([]accountWithLoad(nil), routingWaitCandidates...)
 
 			if len(routingAvailable) > 0 {
 				if platform == PlatformAntigravity {
@@ -1703,6 +1752,24 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 						if s.debugModelRoutingEnabled() {
 							logger.LegacyPrintf("service.gateway", "[ModelRoutingDebug] routed select: group_id=%v model=%s session=%s account=%d", derefGroupID(groupID), requestedModel, shortSessionHash(sessionHash), item.account.ID)
 						}
+						if platform == PlatformAntigravity {
+							s.logAntigravitySelectionTrace(ctx, groupID, sessionHash, requestedModel, antigravitySelectionTrace{
+								Flow:              "load_aware",
+								Scope:             "routed",
+								ScopeAccountIDs:   append([]int64(nil), routingAccountIDs...),
+								SelectedSource:    "immediate",
+								SelectedAccountID: item.account.ID,
+								SelectedMode:      antigravitySelectionModeLabel(s.antigravityModelSelectionMode(ctx, item.account, requestedModel)),
+								Candidates: annotateAntigravitySelectionTraceCandidates(
+									append([]antigravitySelectionCandidateTrace(nil), antigravityTraceCandidates...),
+									initialRoutingAvailable,
+									initialRoutingWaitCandidates,
+									item.account.ID,
+									"immediate",
+									nil,
+								),
+							})
+						}
 						return s.newSelectionResult(ctx, item.account, true, result.ReleaseFunc, nil)
 					}
 				}
@@ -1712,12 +1779,32 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 			// 5. 路由账号仍有真实槽位但在获取时被并发抢占，返回等待计划。
 			// 若所有路由账号都已真正满载，则继续回退到 Layer 2 普通选择。
 			if len(routingAvailable) > 0 {
+				waitOrderIDs := extractAccountLoadIDs(routingAvailable)
 				for _, item := range routingAvailable {
 					if !s.checkAndRegisterSession(ctx, item.account, sessionHash) {
 						continue // 会话限制已满，尝试下一个
 					}
 					if s.debugModelRoutingEnabled() {
 						logger.LegacyPrintf("service.gateway", "[ModelRoutingDebug] routed wait: group_id=%v model=%s session=%s account=%d", derefGroupID(groupID), requestedModel, shortSessionHash(sessionHash), item.account.ID)
+					}
+					if platform == PlatformAntigravity {
+						s.logAntigravitySelectionTrace(ctx, groupID, sessionHash, requestedModel, antigravitySelectionTrace{
+							Flow:              "load_aware",
+							Scope:             "routed",
+							ScopeAccountIDs:   append([]int64(nil), routingAccountIDs...),
+							SelectedSource:    "wait_plan",
+							SelectedAccountID: item.account.ID,
+							SelectedMode:      antigravitySelectionModeLabel(s.antigravityModelSelectionMode(ctx, item.account, requestedModel)),
+							WaitOrderIDs:      waitOrderIDs,
+							Candidates: annotateAntigravitySelectionTraceCandidates(
+								append([]antigravitySelectionCandidateTrace(nil), antigravityTraceCandidates...),
+								initialRoutingAvailable,
+								initialRoutingWaitCandidates,
+								item.account.ID,
+								"wait_plan",
+								nil,
+							),
+						})
 					}
 					return s.newSelectionResult(ctx, item.account, false, nil, &AccountWaitPlan{
 						AccountID:      item.account.ID,
@@ -1726,10 +1813,52 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 						MaxWaiting:     cfg.StickySessionMaxWaiting,
 					})
 				}
+				if platform == PlatformAntigravity {
+					s.logAntigravitySelectionTrace(ctx, groupID, sessionHash, requestedModel, antigravitySelectionTrace{
+						Flow:            "load_aware",
+						Scope:           "routed",
+						ScopeAccountIDs: append([]int64(nil), routingAccountIDs...),
+						SelectedSource:  "no_wait_candidate_after_session_limit",
+						WaitOrderIDs:    waitOrderIDs,
+						Candidates: annotateAntigravitySelectionTraceCandidates(
+							append([]antigravitySelectionCandidateTrace(nil), antigravityTraceCandidates...),
+							initialRoutingAvailable,
+							initialRoutingWaitCandidates,
+							0,
+							"",
+							nil,
+						),
+					})
+				}
 				// 所有路由账号会话限制都已满，继续到 Layer 2 回退
+			} else if platform == PlatformAntigravity {
+				s.logAntigravitySelectionTrace(ctx, groupID, sessionHash, requestedModel, antigravitySelectionTrace{
+					Flow:            "load_aware",
+					Scope:           "routed",
+					ScopeAccountIDs: append([]int64(nil), routingAccountIDs...),
+					SelectedSource:  "no_immediate_candidate",
+					Candidates: annotateAntigravitySelectionTraceCandidates(
+						append([]antigravitySelectionCandidateTrace(nil), antigravityTraceCandidates...),
+						nil,
+						initialRoutingWaitCandidates,
+						0,
+						"",
+						nil,
+					),
+				})
 			}
 			// 路由列表中的账号都不可用，继续到 Layer 2 回退
 			logger.LegacyPrintf("service.gateway", "[ModelRouting] All routed accounts unavailable for model=%s, falling back to normal selection", requestedModel)
+		} else if platform == PlatformAntigravity {
+			s.logAntigravitySelectionTrace(ctx, groupID, sessionHash, requestedModel, antigravitySelectionTrace{
+				Flow:            "load_aware",
+				Scope:           "routed",
+				ScopeAccountIDs: append([]int64(nil), routingAccountIDs...),
+				SelectedSource:  "no_candidates",
+				Candidates: append([]antigravitySelectionCandidateTrace(nil),
+					antigravityTraceCandidates...,
+				),
+			})
 		}
 	}
 
@@ -1761,6 +1890,25 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 							if s.cache != nil {
 								_ = s.cache.RefreshSessionTTL(ctx, derefGroupID(groupID), sessionHash, stickySessionTTL)
 							}
+							if platform == PlatformAntigravity {
+								s.logAntigravitySelectionTrace(ctx, groupID, sessionHash, requestedModel, antigravitySelectionTrace{
+									Flow:              "load_aware",
+									Scope:             "sticky",
+									ScopeAccountIDs:   []int64{accountID},
+									StickyAccountID:   accountID,
+									SelectedSource:    "immediate",
+									SelectedAccountID: accountID,
+									SelectedMode:      antigravitySelectionModeLabel(s.antigravityModelSelectionMode(ctx, account, requestedModel)),
+									Candidates: annotateAntigravitySelectionTraceCandidates(
+										append([]antigravitySelectionCandidateTrace(nil), antigravityTraceCandidates...),
+										nil,
+										nil,
+										accountID,
+										"immediate",
+										nil,
+									),
+								})
+							}
 							return s.newSelectionResult(ctx, account, true, result.ReleaseFunc, nil)
 						}
 					}
@@ -1772,6 +1920,26 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 							if !s.checkAndRegisterSession(ctx, account, sessionHash) {
 								// 会话限制已满，继续到 Layer 2
 							} else {
+								if platform == PlatformAntigravity {
+									s.logAntigravitySelectionTrace(ctx, groupID, sessionHash, requestedModel, antigravitySelectionTrace{
+										Flow:              "load_aware",
+										Scope:             "sticky",
+										ScopeAccountIDs:   []int64{accountID},
+										StickyAccountID:   accountID,
+										SelectedSource:    "wait_plan",
+										SelectedAccountID: accountID,
+										SelectedMode:      antigravitySelectionModeLabel(s.antigravityModelSelectionMode(ctx, account, requestedModel)),
+										WaitOrderIDs:      []int64{accountID},
+										Candidates: annotateAntigravitySelectionTraceCandidates(
+											append([]antigravitySelectionCandidateTrace(nil), antigravityTraceCandidates...),
+											nil,
+											nil,
+											accountID,
+											"wait_plan",
+											nil,
+										),
+									})
+								}
 								return s.newSelectionResult(ctx, account, false, nil, &AccountWaitPlan{
 									AccountID:      accountID,
 									MaxConcurrency: account.Concurrency,
@@ -1824,6 +1992,15 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 	}
 
 	if len(candidates) == 0 {
+		if platform == PlatformAntigravity {
+			s.logAntigravitySelectionTrace(ctx, groupID, sessionHash, requestedModel, antigravitySelectionTrace{
+				Flow:           "load_aware",
+				SelectedSource: "no_candidates",
+				Candidates: append([]antigravitySelectionCandidateTrace(nil),
+					antigravityTraceCandidates...,
+				),
+			})
+		}
 		return nil, ErrNoAvailableAccounts
 	}
 
@@ -1840,6 +2017,26 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 		if result, ok, legacyErr := s.tryAcquireByLegacyOrder(ctx, candidates, groupID, sessionHash, preferOAuth, requestedModel); legacyErr != nil {
 			return nil, legacyErr
 		} else if ok {
+			if platform == PlatformAntigravity && result != nil && result.Account != nil {
+				ordered := append([]*Account(nil), candidates...)
+				ordered = s.preferDirectAntigravityAccounts(ctx, ordered, requestedModel)
+				s.sortAntigravityFallbackCandidates(ctx, requestedModel, ordered)
+				s.logAntigravitySelectionTrace(ctx, groupID, sessionHash, requestedModel, antigravitySelectionTrace{
+					Flow:                "load_aware_legacy_fallback",
+					SelectedSource:      "legacy",
+					SelectedAccountID:   result.Account.ID,
+					SelectedMode:        antigravitySelectionModeLabel(s.antigravityModelSelectionMode(ctx, result.Account, requestedModel)),
+					OrderedCandidateIDs: extractAccountIDs(ordered),
+					Candidates: annotateAntigravitySelectionTraceCandidates(
+						append([]antigravitySelectionCandidateTrace(nil), antigravityTraceCandidates...),
+						nil,
+						nil,
+						result.Account.ID,
+						"legacy",
+						extractAccountIDs(ordered),
+					),
+				})
+			}
 			return result, nil
 		}
 	} else {
@@ -1857,30 +2054,53 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 				available = append(available, item)
 			}
 		}
+		initialAvailable := append([]accountWithLoad(nil), available...)
+		initialWaitCandidates := append([]accountWithLoad(nil), waitCandidates...)
+		var antigravityRounds []antigravitySelectionRoundTrace
 
 		// 分层过滤选择：优先级 → Antigravity 运行态惩罚 → 负载率 → LRU
 		for len(available) > 0 {
+			var traceRound antigravitySelectionRoundTrace
+			if platform == PlatformAntigravity {
+				traceRound.AvailableIDs = extractAccountLoadIDs(available)
+			}
 			// 1. 取优先级最小的集合
 			candidates := filterByMinPriority(available)
+			if platform == PlatformAntigravity {
+				traceRound.MinPriorityIDs = extractAccountLoadIDs(candidates)
+			}
 			// 2. Antigravity 在同优先级内优先使用直连可用账号，只有没有直连候选时才回落到 credits。
 			if platform == PlatformAntigravity {
 				candidates = s.preferDirectAntigravityAccountLoads(ctx, candidates, requestedModel)
+				traceRound.DirectPreferredIDs = extractAccountLoadIDs(candidates)
 			}
 			// 3. Antigravity 先排除近期失败/慢首字的账号，再看负载
 			if platform == PlatformAntigravity {
 				candidates = s.filterByMinAntigravityRuntimePenalty(candidates)
+				traceRound.MinRuntimePenaltyIDs = extractAccountLoadIDs(candidates)
 			}
 			// 4. Antigravity 在同运行态层里优先复用已有成功记录的 warm 账号，
 			// 冷号只在没有 warm 候选时再参与竞争，避免前排假活跃号拖慢命中。
 			if platform == PlatformAntigravity {
 				candidates = preferWarmAntigravityAccountLoads(candidates)
+				traceRound.WarmPreferredIDs = extractAccountLoadIDs(candidates)
 			}
 			// 5. 取负载率最低的集合
 			candidates = filterByMinLoadRate(candidates)
+			if platform == PlatformAntigravity {
+				traceRound.MinLoadIDs = extractAccountLoadIDs(candidates)
+			}
 			// 6. LRU 选择最久未用的账号
 			selected := selectByLRU(candidates, preferOAuth)
 			if selected == nil {
+				if platform == PlatformAntigravity {
+					antigravityRounds = append(antigravityRounds, traceRound)
+				}
 				break
+			}
+			if platform == PlatformAntigravity {
+				traceRound.SelectedAccountID = selected.account.ID
+				antigravityRounds = append(antigravityRounds, traceRound)
 			}
 
 			result, err := s.tryAcquireAccountSlot(ctx, selected.account.ID, selected.account.Concurrency)
@@ -1890,6 +2110,23 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 					result.ReleaseFunc() // 释放槽位，继续尝试下一个账号
 				} else {
 					_ = s.bindStickySessionForSelection(ctx, groupID, sessionHash, selected.account, requestedModel)
+					if platform == PlatformAntigravity {
+						s.logAntigravitySelectionTrace(ctx, groupID, sessionHash, requestedModel, antigravitySelectionTrace{
+							Flow:              "load_aware",
+							SelectedSource:    "immediate",
+							SelectedAccountID: selected.account.ID,
+							SelectedMode:      antigravitySelectionModeLabel(s.antigravityModelSelectionMode(ctx, selected.account, requestedModel)),
+							Rounds:            antigravityRounds,
+							Candidates: annotateAntigravitySelectionTraceCandidates(
+								append([]antigravitySelectionCandidateTrace(nil), antigravityTraceCandidates...),
+								initialAvailable,
+								initialWaitCandidates,
+								selected.account.ID,
+								"immediate",
+								nil,
+							),
+						})
+					}
 					return s.newSelectionResult(ctx, selected.account, true, result.ReleaseFunc, nil)
 				}
 			}
@@ -1912,16 +2149,49 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 			sort.SliceStable(waitCandidates, func(i, j int) bool {
 				return s.lessWaitCandidate(ctx, requestedModel, preferOAuth, waitCandidates[i], waitCandidates[j])
 			})
+			waitOrderIDs := extractAccountLoadIDs(waitCandidates)
 			for _, item := range waitCandidates {
 				// 会话数量限制检查（等待计划也需要占用会话配额）
 				if !s.checkAndRegisterSession(ctx, item.account, sessionHash) {
 					continue
+				}
+				if platform == PlatformAntigravity {
+					s.logAntigravitySelectionTrace(ctx, groupID, sessionHash, requestedModel, antigravitySelectionTrace{
+						Flow:              "load_aware",
+						SelectedSource:    "wait_plan",
+						SelectedAccountID: item.account.ID,
+						SelectedMode:      antigravitySelectionModeLabel(s.antigravityModelSelectionMode(ctx, item.account, requestedModel)),
+						WaitOrderIDs:      waitOrderIDs,
+						Candidates: annotateAntigravitySelectionTraceCandidates(
+							append([]antigravitySelectionCandidateTrace(nil), antigravityTraceCandidates...),
+							initialAvailable,
+							initialWaitCandidates,
+							item.account.ID,
+							"wait_plan",
+							nil,
+						),
+					})
 				}
 				return s.newSelectionResult(ctx, item.account, false, nil, &AccountWaitPlan{
 					AccountID:      item.account.ID,
 					MaxConcurrency: item.account.Concurrency,
 					Timeout:        cfg.FallbackWaitTimeout,
 					MaxWaiting:     cfg.FallbackMaxWaiting,
+				})
+			}
+			if platform == PlatformAntigravity {
+				s.logAntigravitySelectionTrace(ctx, groupID, sessionHash, requestedModel, antigravitySelectionTrace{
+					Flow:           "load_aware",
+					SelectedSource: "no_wait_candidate_after_session_limit",
+					WaitOrderIDs:   waitOrderIDs,
+					Candidates: annotateAntigravitySelectionTraceCandidates(
+						append([]antigravitySelectionCandidateTrace(nil), antigravityTraceCandidates...),
+						initialAvailable,
+						initialWaitCandidates,
+						0,
+						"",
+						nil,
+					),
 				})
 			}
 			return nil, ErrNoAvailableAccounts
@@ -1935,16 +2205,49 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 	} else {
 		s.sortCandidatesForFallback(candidates, preferOAuth, cfg.FallbackSelectionMode)
 	}
+	orderedFallbackIDs := extractAccountIDs(candidates)
 	for _, acc := range candidates {
 		// 会话数量限制检查（等待计划也需要占用会话配额）
 		if !s.checkAndRegisterSession(ctx, acc, sessionHash) {
 			continue // 会话限制已满，尝试下一个账号
+		}
+		if platform == PlatformAntigravity {
+			s.logAntigravitySelectionTrace(ctx, groupID, sessionHash, requestedModel, antigravitySelectionTrace{
+				Flow:                "fallback_queue",
+				SelectedSource:      "fallback_queue",
+				SelectedAccountID:   acc.ID,
+				SelectedMode:        antigravitySelectionModeLabel(s.antigravityModelSelectionMode(ctx, acc, requestedModel)),
+				OrderedCandidateIDs: orderedFallbackIDs,
+				Candidates: annotateAntigravitySelectionTraceCandidates(
+					append([]antigravitySelectionCandidateTrace(nil), antigravityTraceCandidates...),
+					nil,
+					nil,
+					acc.ID,
+					"fallback_queue",
+					orderedFallbackIDs,
+				),
+			})
 		}
 		return s.newSelectionResult(ctx, acc, false, nil, &AccountWaitPlan{
 			AccountID:      acc.ID,
 			MaxConcurrency: acc.Concurrency,
 			Timeout:        cfg.FallbackWaitTimeout,
 			MaxWaiting:     cfg.FallbackMaxWaiting,
+		})
+	}
+	if platform == PlatformAntigravity {
+		s.logAntigravitySelectionTrace(ctx, groupID, sessionHash, requestedModel, antigravitySelectionTrace{
+			Flow:                "fallback_queue",
+			SelectedSource:      "no_fallback_queue_candidate_after_session_limit",
+			OrderedCandidateIDs: orderedFallbackIDs,
+			Candidates: annotateAntigravitySelectionTraceCandidates(
+				append([]antigravitySelectionCandidateTrace(nil), antigravityTraceCandidates...),
+				nil,
+				nil,
+				0,
+				"",
+				orderedFallbackIDs,
+			),
 		})
 	}
 	return nil, ErrNoAvailableAccounts
@@ -3351,6 +3654,7 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 
 	var accounts []Account
 	accountsLoaded := false
+	var antigravityLegacyTraceCandidates []antigravitySelectionCandidateTrace
 
 	// ============ Model Routing (legacy path): apply before sticky session ============
 	// When load-awareness is disabled (e.g. concurrency service not configured), we still honor model routing
@@ -3398,6 +3702,9 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 		// 提前预取窗口费用+RPM 计数，确保 routing 段内的调度检查调用能命中缓存
 		ctx = s.withWindowCostPrefetch(ctx, accounts)
 		ctx = s.withRPMPrefetch(ctx, accounts)
+		if platform == PlatformAntigravity {
+			antigravityLegacyTraceCandidates = s.buildAntigravitySelectionTraceCandidates(ctx, accounts, requestedModel, excludedIDs)
+		}
 
 		routingSet := make(map[int64]struct{}, len(routingAccountIDs))
 		for _, id := range routingAccountIDs {
@@ -3407,6 +3714,7 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 		}
 
 		var selected *Account
+		eligibleRoutedCandidates := make([]*Account, 0, len(accounts))
 		for i := range accounts {
 			acc := &accounts[i]
 			if _, ok := routingSet[acc.ID]; !ok {
@@ -3441,6 +3749,7 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 			if !s.isAccountSchedulableForRPM(ctx, acc, false) {
 				continue
 			}
+			eligibleRoutedCandidates = append(eligibleRoutedCandidates, acc)
 			if s.isBetterLegacyCandidate(ctx, requestedModel, acc, selected, preferOAuth) {
 				selected = acc
 			}
@@ -3453,7 +3762,41 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 			if s.debugModelRoutingEnabled() {
 				logger.LegacyPrintf("service.gateway", "[ModelRoutingDebug] legacy routed select: group_id=%v model=%s session=%s account=%d", derefGroupID(groupID), requestedModel, shortSessionHash(sessionHash), selected.ID)
 			}
+			if platform == PlatformAntigravity {
+				ordered := append([]*Account(nil), eligibleRoutedCandidates...)
+				ordered = s.preferDirectAntigravityAccounts(ctx, ordered, requestedModel)
+				s.sortAntigravityFallbackCandidates(ctx, requestedModel, ordered)
+				orderedIDs := extractAccountIDs(ordered)
+				s.logAntigravitySelectionTrace(ctx, groupID, sessionHash, requestedModel, antigravitySelectionTrace{
+					Flow:                "legacy",
+					Scope:               "routed",
+					ScopeAccountIDs:     append([]int64(nil), routingAccountIDs...),
+					SelectedSource:      "legacy",
+					SelectedAccountID:   selected.ID,
+					SelectedMode:        antigravitySelectionModeLabel(s.antigravityModelSelectionMode(ctx, selected, requestedModel)),
+					OrderedCandidateIDs: orderedIDs,
+					Candidates: annotateAntigravitySelectionTraceCandidates(
+						append([]antigravitySelectionCandidateTrace(nil), antigravityLegacyTraceCandidates...),
+						nil,
+						nil,
+						selected.ID,
+						"legacy",
+						orderedIDs,
+					),
+				})
+			}
 			return selected, nil
+		}
+		if platform == PlatformAntigravity {
+			s.logAntigravitySelectionTrace(ctx, groupID, sessionHash, requestedModel, antigravitySelectionTrace{
+				Flow:            "legacy",
+				Scope:           "routed",
+				ScopeAccountIDs: append([]int64(nil), routingAccountIDs...),
+				SelectedSource:  "no_candidates",
+				Candidates: append([]antigravitySelectionCandidateTrace(nil),
+					antigravityLegacyTraceCandidates...,
+				),
+			})
 		}
 		logger.LegacyPrintf("service.gateway", "[ModelRouting] No routed accounts available for model=%s, falling back to normal selection", requestedModel)
 	}
@@ -3471,6 +3814,25 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 						_ = s.cache.DeleteSessionAccountID(ctx, derefGroupID(groupID), sessionHash)
 					}
 					if !clearSticky && s.isAccountInGroup(account, groupID) && account.Platform == platform && (requestedModel == "" || s.isModelSupportedByAccountWithContext(ctx, account, requestedModel)) && s.isAccountSchedulableForModelSelection(ctx, account, requestedModel) && s.isAccountSchedulableForQuota(account) && s.isAccountSchedulableForWindowCost(ctx, account, true) && s.isAccountSchedulableForRPM(ctx, account, true) {
+						if platform == PlatformAntigravity && len(antigravityLegacyTraceCandidates) > 0 {
+							s.logAntigravitySelectionTrace(ctx, groupID, sessionHash, requestedModel, antigravitySelectionTrace{
+								Flow:              "legacy",
+								Scope:             "sticky",
+								ScopeAccountIDs:   []int64{accountID},
+								StickyAccountID:   accountID,
+								SelectedSource:    "immediate",
+								SelectedAccountID: accountID,
+								SelectedMode:      antigravitySelectionModeLabel(s.antigravityModelSelectionMode(ctx, account, requestedModel)),
+								Candidates: annotateAntigravitySelectionTraceCandidates(
+									append([]antigravitySelectionCandidateTrace(nil), antigravityLegacyTraceCandidates...),
+									nil,
+									nil,
+									accountID,
+									"immediate",
+									nil,
+								),
+							})
+						}
 						return account, nil
 					}
 				}
@@ -3494,12 +3856,16 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 	// 批量预取窗口费用+RPM 计数，避免逐个账号查询（N+1）
 	ctx = s.withWindowCostPrefetch(ctx, accounts)
 	ctx = s.withRPMPrefetch(ctx, accounts)
+	if platform == PlatformAntigravity && len(antigravityLegacyTraceCandidates) == 0 {
+		antigravityLegacyTraceCandidates = s.buildAntigravitySelectionTraceCandidates(ctx, accounts, requestedModel, excludedIDs)
+	}
 
 	// 3. 按优先级+最久未用选择（考虑模型支持）
 	// needsUpstreamCheck 仅在主选择循环中使用；粘性会话命中时跳过此检查，
 	// 因为粘性会话优先保持连接一致性，且 upstream 计费基准极少使用。
 	needsUpstreamCheck := s.needsUpstreamChannelRestrictionCheck(ctx, groupID)
 	var selected *Account
+	eligibleCandidates := make([]*Account, 0, len(accounts))
 	for i := range accounts {
 		acc := &accounts[i]
 		if _, excluded := excludedIDs[acc.ID]; excluded {
@@ -3534,12 +3900,22 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 		if !s.isAccountSchedulableForRPM(ctx, acc, false) {
 			continue
 		}
+		eligibleCandidates = append(eligibleCandidates, acc)
 		if s.isBetterLegacyCandidate(ctx, requestedModel, acc, selected, preferOAuth) {
 			selected = acc
 		}
 	}
 
 	if selected == nil {
+		if platform == PlatformAntigravity {
+			s.logAntigravitySelectionTrace(ctx, groupID, sessionHash, requestedModel, antigravitySelectionTrace{
+				Flow:           "legacy",
+				SelectedSource: "no_candidates",
+				Candidates: append([]antigravitySelectionCandidateTrace(nil),
+					antigravityLegacyTraceCandidates...,
+				),
+			})
+		}
 		stats := s.logDetailedSelectionFailure(ctx, groupID, sessionHash, requestedModel, platform, accounts, excludedIDs, false)
 		if requestedModel != "" {
 			return nil, fmt.Errorf("%w supporting model: %s (%s)", ErrNoAvailableAccounts, requestedModel, summarizeSelectionFailureStats(stats))
@@ -3550,6 +3926,27 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 	// 4. 建立粘性绑定
 	if err := s.bindStickySessionForSelection(ctx, groupID, sessionHash, selected, requestedModel); err != nil {
 		logger.LegacyPrintf("service.gateway", "set session account failed: session=%s account_id=%d err=%v", sessionHash, selected.ID, err)
+	}
+	if platform == PlatformAntigravity {
+		ordered := append([]*Account(nil), eligibleCandidates...)
+		ordered = s.preferDirectAntigravityAccounts(ctx, ordered, requestedModel)
+		s.sortAntigravityFallbackCandidates(ctx, requestedModel, ordered)
+		orderedIDs := extractAccountIDs(ordered)
+		s.logAntigravitySelectionTrace(ctx, groupID, sessionHash, requestedModel, antigravitySelectionTrace{
+			Flow:                "legacy",
+			SelectedSource:      "legacy",
+			SelectedAccountID:   selected.ID,
+			SelectedMode:        antigravitySelectionModeLabel(s.antigravityModelSelectionMode(ctx, selected, requestedModel)),
+			OrderedCandidateIDs: orderedIDs,
+			Candidates: annotateAntigravitySelectionTraceCandidates(
+				append([]antigravitySelectionCandidateTrace(nil), antigravityLegacyTraceCandidates...),
+				nil,
+				nil,
+				selected.ID,
+				"legacy",
+				orderedIDs,
+			),
+		})
 	}
 
 	return selected, nil
@@ -3775,21 +4172,64 @@ func (s *GatewayService) selectAccountWithMixedScheduling(ctx context.Context, g
 }
 
 type selectionFailureStats struct {
-	Total              int
-	Eligible           int
-	Excluded           int
-	Unschedulable      int
-	PlatformFiltered   int
-	ModelUnsupported   int
-	ModelRateLimited   int
-	SamplePlatformIDs  []int64
-	SampleMappingIDs   []int64
-	SampleRateLimitIDs []string
+	Total               int
+	Eligible            int
+	Excluded            int
+	Unschedulable       int
+	PlatformFiltered    int
+	ModelUnsupported    int
+	ModelRateLimited    int
+	QuotaExceeded       int
+	WindowCostLimited   int
+	RPMLimited          int
+	SamplePlatformIDs   []int64
+	SampleMappingIDs    []int64
+	SampleRateLimitIDs  []string
+	SampleQuotaIDs      []int64
+	SampleWindowCostIDs []int64
+	SampleRPMIDs        []int64
 }
 
 type selectionFailureDiagnosis struct {
 	Category string
 	Detail   string
+}
+
+type antigravitySelectionCandidateTrace struct {
+	AccountID          int64  `json:"account_id"`
+	Mode               string `json:"mode,omitempty"`
+	Status             string `json:"status,omitempty"`
+	Reason             string `json:"reason,omitempty"`
+	Detail             string `json:"detail,omitempty"`
+	Priority           int    `json:"priority,omitempty"`
+	LoadRate           int    `json:"load_rate,omitempty"`
+	CurrentConcurrency int    `json:"current_concurrency,omitempty"`
+	WaitingCount       int    `json:"waiting_count,omitempty"`
+	LastUsedAt         string `json:"last_used_at,omitempty"`
+}
+
+type antigravitySelectionRoundTrace struct {
+	AvailableIDs         []int64 `json:"available_ids,omitempty"`
+	MinPriorityIDs       []int64 `json:"min_priority_ids,omitempty"`
+	DirectPreferredIDs   []int64 `json:"direct_preferred_ids,omitempty"`
+	MinRuntimePenaltyIDs []int64 `json:"min_runtime_penalty_ids,omitempty"`
+	WarmPreferredIDs     []int64 `json:"warm_preferred_ids,omitempty"`
+	MinLoadIDs           []int64 `json:"min_load_ids,omitempty"`
+	SelectedAccountID    int64   `json:"selected_account_id,omitempty"`
+}
+
+type antigravitySelectionTrace struct {
+	Flow                string                               `json:"flow"`
+	Scope               string                               `json:"scope,omitempty"`
+	ScopeAccountIDs     []int64                              `json:"scope_account_ids,omitempty"`
+	StickyAccountID     int64                                `json:"sticky_account_id,omitempty"`
+	SelectedSource      string                               `json:"selected_source,omitempty"`
+	SelectedAccountID   int64                                `json:"selected_account_id,omitempty"`
+	SelectedMode        string                               `json:"selected_mode,omitempty"`
+	OrderedCandidateIDs []int64                              `json:"ordered_candidate_ids,omitempty"`
+	WaitOrderIDs        []int64                              `json:"wait_order_ids,omitempty"`
+	Rounds              []antigravitySelectionRoundTrace     `json:"rounds,omitempty"`
+	Candidates          []antigravitySelectionCandidateTrace `json:"candidates,omitempty"`
 }
 
 func (s *GatewayService) logDetailedSelectionFailure(
@@ -3805,7 +4245,7 @@ func (s *GatewayService) logDetailedSelectionFailure(
 	stats := s.collectSelectionFailureStats(ctx, accounts, requestedModel, platform, excludedIDs, allowMixedScheduling)
 	logger.LegacyPrintf(
 		"service.gateway",
-		"[SelectAccountDetailed] group_id=%v model=%s platform=%s session=%s total=%d eligible=%d excluded=%d unschedulable=%d platform_filtered=%d model_unsupported=%d model_rate_limited=%d sample_platform_filtered=%v sample_model_unsupported=%v sample_model_rate_limited=%v",
+		"[SelectAccountDetailed] group_id=%v model=%s platform=%s session=%s total=%d eligible=%d excluded=%d unschedulable=%d platform_filtered=%d model_unsupported=%d model_rate_limited=%d quota_exceeded=%d window_cost_limited=%d rpm_limited=%d sample_platform_filtered=%v sample_model_unsupported=%v sample_model_rate_limited=%v sample_quota_exceeded=%v sample_window_cost_limited=%v sample_rpm_limited=%v",
 		derefGroupID(groupID),
 		requestedModel,
 		platform,
@@ -3817,9 +4257,15 @@ func (s *GatewayService) logDetailedSelectionFailure(
 		stats.PlatformFiltered,
 		stats.ModelUnsupported,
 		stats.ModelRateLimited,
+		stats.QuotaExceeded,
+		stats.WindowCostLimited,
+		stats.RPMLimited,
 		stats.SamplePlatformIDs,
 		stats.SampleMappingIDs,
 		stats.SampleRateLimitIDs,
+		stats.SampleQuotaIDs,
+		stats.SampleWindowCostIDs,
+		stats.SampleRPMIDs,
 	)
 	return stats
 }
@@ -3854,6 +4300,15 @@ func (s *GatewayService) collectSelectionFailureStats(
 			stats.ModelRateLimited++
 			remaining := acc.GetRateLimitRemainingTimeWithContext(ctx, requestedModel).Truncate(time.Second)
 			stats.SampleRateLimitIDs = appendSelectionFailureRateSample(stats.SampleRateLimitIDs, acc.ID, remaining)
+		case "quota_exceeded":
+			stats.QuotaExceeded++
+			stats.SampleQuotaIDs = appendSelectionFailureSampleID(stats.SampleQuotaIDs, acc.ID)
+		case "window_cost_limited":
+			stats.WindowCostLimited++
+			stats.SampleWindowCostIDs = appendSelectionFailureSampleID(stats.SampleWindowCostIDs, acc.ID)
+		case "rpm_limited":
+			stats.RPMLimited++
+			stats.SampleRPMIDs = appendSelectionFailureSampleID(stats.SampleRPMIDs, acc.ID)
 		default:
 			stats.Eligible++
 		}
@@ -3873,11 +4328,32 @@ func (s *GatewayService) diagnoseSelectionFailure(
 	if acc == nil {
 		return selectionFailureDiagnosis{Category: "unschedulable", Detail: "account_nil"}
 	}
+	now := time.Now()
 	if _, excluded := excludedIDs[acc.ID]; excluded {
 		return selectionFailureDiagnosis{Category: "excluded"}
 	}
 	if !s.isAccountSchedulableForSelection(acc) {
-		return selectionFailureDiagnosis{Category: "unschedulable", Detail: "generic_unschedulable"}
+		switch {
+		case !acc.IsActive():
+			return selectionFailureDiagnosis{Category: "unschedulable", Detail: fmt.Sprintf("inactive_status=%s", acc.Status)}
+		case acc.AutoPauseOnExpired && acc.ExpiresAt != nil && !now.Before(*acc.ExpiresAt):
+			return selectionFailureDiagnosis{Category: "unschedulable", Detail: fmt.Sprintf("expired_at=%s", acc.ExpiresAt.UTC().Format(time.RFC3339))}
+		case acc.OverloadUntil != nil && now.Before(*acc.OverloadUntil):
+			return selectionFailureDiagnosis{Category: "unschedulable", Detail: fmt.Sprintf("overload_until=%s", acc.OverloadUntil.UTC().Format(time.RFC3339))}
+		case acc.RateLimitResetAt != nil && now.Before(*acc.RateLimitResetAt):
+			return selectionFailureDiagnosis{Category: "unschedulable", Detail: fmt.Sprintf("rate_limit_reset_at=%s", acc.RateLimitResetAt.UTC().Format(time.RFC3339))}
+		case acc.TempUnschedulableUntil != nil && now.Before(*acc.TempUnschedulableUntil):
+			return selectionFailureDiagnosis{
+				Category: "unschedulable",
+				Detail: fmt.Sprintf(
+					"temp_unschedulable_until=%s reason=%s",
+					acc.TempUnschedulableUntil.UTC().Format(time.RFC3339),
+					strings.TrimSpace(acc.TempUnschedulableReason),
+				),
+			}
+		default:
+			return selectionFailureDiagnosis{Category: "unschedulable", Detail: "generic_unschedulable"}
+		}
 	}
 	if isPlatformFilteredForSelection(acc, platform, allowMixedScheduling) {
 		return selectionFailureDiagnosis{
@@ -3896,6 +4372,24 @@ func (s *GatewayService) diagnoseSelectionFailure(
 		return selectionFailureDiagnosis{
 			Category: "model_rate_limited",
 			Detail:   fmt.Sprintf("remaining=%s", remaining),
+		}
+	}
+	if !s.isAccountSchedulableForQuota(acc) {
+		return selectionFailureDiagnosis{
+			Category: "quota_exceeded",
+			Detail:   "quota_limit_exceeded",
+		}
+	}
+	if !s.isAccountSchedulableForWindowCost(ctx, acc, false) {
+		return selectionFailureDiagnosis{
+			Category: "window_cost_limited",
+			Detail:   fmt.Sprintf("window_cost_limit=%.2f", acc.GetWindowCostLimit()),
+		}
+	}
+	if !s.isAccountSchedulableForRPM(ctx, acc, false) {
+		return selectionFailureDiagnosis{
+			Category: "rpm_limited",
+			Detail:   fmt.Sprintf("base_rpm=%d", acc.GetBaseRPM()),
 		}
 	}
 	return selectionFailureDiagnosis{Category: "eligible"}
@@ -3935,7 +4429,7 @@ func appendSelectionFailureRateSample(samples []string, accountID int64, remaini
 
 func summarizeSelectionFailureStats(stats selectionFailureStats) string {
 	return fmt.Sprintf(
-		"total=%d eligible=%d excluded=%d unschedulable=%d platform_filtered=%d model_unsupported=%d model_rate_limited=%d",
+		"total=%d eligible=%d excluded=%d unschedulable=%d platform_filtered=%d model_unsupported=%d model_rate_limited=%d quota_exceeded=%d window_cost_limited=%d rpm_limited=%d",
 		stats.Total,
 		stats.Eligible,
 		stats.Excluded,
@@ -3943,6 +4437,174 @@ func summarizeSelectionFailureStats(stats selectionFailureStats) string {
 		stats.PlatformFiltered,
 		stats.ModelUnsupported,
 		stats.ModelRateLimited,
+		stats.QuotaExceeded,
+		stats.WindowCostLimited,
+		stats.RPMLimited,
+	)
+}
+
+func antigravitySelectionModeLabel(mode antigravityModelSelectionMode) string {
+	switch mode {
+	case antigravityModelSelectionDirect:
+		return "direct"
+	case antigravityModelSelectionCreditsFallback:
+		return "credits_fallback"
+	default:
+		return "unavailable"
+	}
+}
+
+func (s *GatewayService) buildAntigravitySelectionTraceCandidates(
+	ctx context.Context,
+	accounts []Account,
+	requestedModel string,
+	excludedIDs map[int64]struct{},
+) []antigravitySelectionCandidateTrace {
+	if len(accounts) == 0 {
+		return nil
+	}
+	items := make([]antigravitySelectionCandidateTrace, 0, len(accounts))
+	for i := range accounts {
+		acc := &accounts[i]
+		diagnosis := s.diagnoseSelectionFailure(ctx, acc, requestedModel, PlatformAntigravity, excludedIDs, false)
+		item := antigravitySelectionCandidateTrace{
+			AccountID: acc.ID,
+			Mode:      antigravitySelectionModeLabel(s.antigravityModelSelectionMode(ctx, acc, requestedModel)),
+			Status:    "eligible",
+			Priority:  acc.Priority,
+		}
+		if acc.LastUsedAt != nil {
+			item.LastUsedAt = acc.LastUsedAt.UTC().Format(time.RFC3339)
+		}
+		if diagnosis.Category != "eligible" {
+			item.Status = "filtered"
+			item.Reason = diagnosis.Category
+			item.Detail = diagnosis.Detail
+		}
+		items = append(items, item)
+	}
+	return items
+}
+
+func annotateAntigravitySelectionTraceCandidates(
+	items []antigravitySelectionCandidateTrace,
+	available []accountWithLoad,
+	waitCandidates []accountWithLoad,
+	selectedAccountID int64,
+	selectedSource string,
+	orderedIDs []int64,
+) []antigravitySelectionCandidateTrace {
+	if len(items) == 0 {
+		return items
+	}
+	byID := make(map[int64]*antigravitySelectionCandidateTrace, len(items))
+	for i := range items {
+		byID[items[i].AccountID] = &items[i]
+	}
+	for _, item := range waitCandidates {
+		if item.account == nil {
+			continue
+		}
+		traceItem, ok := byID[item.account.ID]
+		if !ok {
+			continue
+		}
+		traceItem.Status = "wait_candidate"
+		if item.loadInfo != nil {
+			traceItem.LoadRate = item.loadInfo.LoadRate
+			traceItem.CurrentConcurrency = item.loadInfo.CurrentConcurrency
+			traceItem.WaitingCount = item.loadInfo.WaitingCount
+		}
+	}
+	for _, item := range available {
+		if item.account == nil {
+			continue
+		}
+		traceItem, ok := byID[item.account.ID]
+		if !ok {
+			continue
+		}
+		traceItem.Status = "immediate_candidate"
+		if item.loadInfo != nil {
+			traceItem.LoadRate = item.loadInfo.LoadRate
+			traceItem.CurrentConcurrency = item.loadInfo.CurrentConcurrency
+			traceItem.WaitingCount = item.loadInfo.WaitingCount
+		}
+	}
+	for _, accountID := range orderedIDs {
+		traceItem, ok := byID[accountID]
+		if !ok || traceItem.Status != "eligible" {
+			continue
+		}
+		traceItem.Status = "ordered_candidate"
+	}
+	if selectedAccountID > 0 {
+		if traceItem, ok := byID[selectedAccountID]; ok {
+			switch selectedSource {
+			case "wait_plan", "fallback_queue":
+				traceItem.Status = "selected_wait_candidate"
+			default:
+				traceItem.Status = "selected"
+			}
+		}
+	}
+	return items
+}
+
+func extractAccountIDs(accounts []*Account) []int64 {
+	if len(accounts) == 0 {
+		return nil
+	}
+	ids := make([]int64, 0, len(accounts))
+	for _, account := range accounts {
+		if account == nil {
+			continue
+		}
+		ids = append(ids, account.ID)
+	}
+	return ids
+}
+
+func extractAccountLoadIDs(accounts []accountWithLoad) []int64 {
+	if len(accounts) == 0 {
+		return nil
+	}
+	ids := make([]int64, 0, len(accounts))
+	for _, account := range accounts {
+		if account.account == nil {
+			continue
+		}
+		ids = append(ids, account.account.ID)
+	}
+	return ids
+}
+
+func (s *GatewayService) logAntigravitySelectionTrace(
+	ctx context.Context,
+	groupID *int64,
+	sessionHash string,
+	requestedModel string,
+	trace antigravitySelectionTrace,
+) {
+	if len(trace.Candidates) == 0 {
+		return
+	}
+	logger.FromContext(ctx).Info(
+		"gateway.antigravity_selection_trace",
+		zap.Int64("group_id", derefGroupID(groupID)),
+		zap.String("model", requestedModel),
+		zap.String("session", shortSessionHash(sessionHash)),
+		zap.String("flow", trace.Flow),
+		zap.String("scope", trace.Scope),
+		zap.Int64s("scope_account_ids", trace.ScopeAccountIDs),
+		zap.Int64("sticky_account_id", trace.StickyAccountID),
+		zap.String("selected_source", trace.SelectedSource),
+		zap.Int64("selected_account_id", trace.SelectedAccountID),
+		zap.String("selected_mode", trace.SelectedMode),
+		zap.Int64s("ordered_candidate_ids", trace.OrderedCandidateIDs),
+		zap.Int64s("wait_order_ids", trace.WaitOrderIDs),
+		zap.Any("rounds", trace.Rounds),
+		zap.Any("candidates", trace.Candidates),
 	)
 }
 
