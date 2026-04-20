@@ -28,8 +28,12 @@ func resetModelCapacityExhaustedStateForTest(t *testing.T) {
 
 	clearState := func() {
 		modelCapacityExhaustedMu.Lock()
-		defer modelCapacityExhaustedMu.Unlock()
 		modelCapacityExhaustedUntil = make(map[string]time.Time)
+		modelCapacityExhaustedMu.Unlock()
+
+		antigravityModelCapacityCooldownMu.Lock()
+		antigravityModelCapacityCooldownUntil = make(map[antigravityModelCapacityCooldownKey]time.Time)
+		antigravityModelCapacityCooldownMu.Unlock()
 	}
 
 	clearState()

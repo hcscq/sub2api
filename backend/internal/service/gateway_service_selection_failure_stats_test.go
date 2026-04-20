@@ -95,6 +95,40 @@ func TestCollectSelectionFailureStats(t *testing.T) {
 	}
 }
 
+func TestCollectSelectionFailureStats_ModelCapacityCooldown(t *testing.T) {
+	svc := &GatewayService{}
+	ctx := context.Background()
+	model := "claude-opus-4-6"
+	account := Account{
+		ID:          11,
+		Platform:    PlatformAntigravity,
+		Status:      StatusActive,
+		Schedulable: true,
+	}
+	finalModelKey := normalizeAntigravityModelCapacityCooldownKey(ctx, &account, model)
+
+	if _, ok := setAntigravityModelCapacityCooldown(account.ID, finalModelKey, 5*time.Second); !ok {
+		t.Fatal("expected runtime model-capacity cooldown to be set")
+	}
+	t.Cleanup(func() {
+		clearAntigravityModelCapacityCooldown(account.ID, finalModelKey)
+	})
+
+	stats := svc.collectSelectionFailureStats(ctx, []Account{account}, model, PlatformAntigravity, nil, false)
+	if stats.Total != 1 {
+		t.Fatalf("total=%d want=1", stats.Total)
+	}
+	if stats.ModelCapacityCooldown != 1 {
+		t.Fatalf("model_capacity_cooldown=%d want=1", stats.ModelCapacityCooldown)
+	}
+	if stats.ModelRateLimited != 0 {
+		t.Fatalf("model_rate_limited=%d want=0", stats.ModelRateLimited)
+	}
+	if len(stats.SampleModelCapacityCooldownIDs) != 1 {
+		t.Fatalf("sample_model_capacity_cooldown=%v want=1 sample", stats.SampleModelCapacityCooldownIDs)
+	}
+}
+
 func TestDiagnoseSelectionFailure_UnschedulableDetail(t *testing.T) {
 	svc := &GatewayService{}
 	acc := &Account{
@@ -134,6 +168,33 @@ func TestDiagnoseSelectionFailure_ModelRateLimitedDetail(t *testing.T) {
 	diagnosis := svc.diagnoseSelectionFailure(context.Background(), acc, model, PlatformOpenAI, map[int64]struct{}{}, false)
 	if diagnosis.Category != "model_rate_limited" {
 		t.Fatalf("category=%s want=model_rate_limited", diagnosis.Category)
+	}
+	if !strings.Contains(diagnosis.Detail, "remaining=") {
+		t.Fatalf("detail=%s want contains remaining=", diagnosis.Detail)
+	}
+}
+
+func TestDiagnoseSelectionFailure_ModelCapacityCooldownDetail(t *testing.T) {
+	svc := &GatewayService{}
+	model := "claude-opus-4-6"
+	acc := &Account{
+		ID:          18,
+		Platform:    PlatformAntigravity,
+		Status:      StatusActive,
+		Schedulable: true,
+	}
+	finalModelKey := normalizeAntigravityModelCapacityCooldownKey(context.Background(), acc, model)
+
+	if _, ok := setAntigravityModelCapacityCooldown(acc.ID, finalModelKey, 5*time.Second); !ok {
+		t.Fatal("expected runtime model-capacity cooldown to be set")
+	}
+	t.Cleanup(func() {
+		clearAntigravityModelCapacityCooldown(acc.ID, finalModelKey)
+	})
+
+	diagnosis := svc.diagnoseSelectionFailure(context.Background(), acc, model, PlatformAntigravity, map[int64]struct{}{}, false)
+	if diagnosis.Category != "model_capacity_cooldown" {
+		t.Fatalf("category=%s want=model_capacity_cooldown", diagnosis.Category)
 	}
 	if !strings.Contains(diagnosis.Detail, "remaining=") {
 		t.Fatalf("detail=%s want contains remaining=", diagnosis.Detail)
@@ -183,6 +244,20 @@ func TestBuildAntigravitySelectionTraceCandidates(t *testing.T) {
 			},
 		},
 	}
+	modelCapacityCooldown := Account{
+		ID:          422,
+		Platform:    PlatformAntigravity,
+		Status:      StatusActive,
+		Schedulable: true,
+		Priority:    1,
+	}
+	finalModelKey := normalizeAntigravityModelCapacityCooldownKey(ctx, &modelCapacityCooldown, model)
+	if _, ok := setAntigravityModelCapacityCooldown(modelCapacityCooldown.ID, finalModelKey, 5*time.Second); !ok {
+		t.Fatal("expected runtime model-capacity cooldown to be set")
+	}
+	t.Cleanup(func() {
+		clearAntigravityModelCapacityCooldown(modelCapacityCooldown.ID, finalModelKey)
+	})
 
 	excluded := Account{
 		ID:          429,
@@ -194,13 +269,13 @@ func TestBuildAntigravitySelectionTraceCandidates(t *testing.T) {
 
 	items := svc.buildAntigravitySelectionTraceCandidates(
 		ctx,
-		[]Account{direct, creditsFallback, modelLimited, excluded},
+		[]Account{direct, creditsFallback, modelLimited, modelCapacityCooldown, excluded},
 		model,
 		map[int64]struct{}{429: {}},
 	)
 
-	if len(items) != 4 {
-		t.Fatalf("len(items)=%d want=4", len(items))
+	if len(items) != 5 {
+		t.Fatalf("len(items)=%d want=5", len(items))
 	}
 
 	byID := make(map[int64]antigravitySelectionCandidateTrace, len(items))
@@ -216,6 +291,9 @@ func TestBuildAntigravitySelectionTraceCandidates(t *testing.T) {
 	}
 	if byID[421].Reason != "model_rate_limited" || byID[421].Status != "filtered" {
 		t.Fatalf("model-limited trace=%+v want filtered model_rate_limited", byID[421])
+	}
+	if byID[422].Reason != "model_capacity_cooldown" || byID[422].Status != "filtered" {
+		t.Fatalf("model-capacity-cooldown trace=%+v want filtered model_capacity_cooldown", byID[422])
 	}
 	if byID[429].Reason != "excluded" || byID[429].Status != "filtered" {
 		t.Fatalf("excluded trace=%+v want filtered excluded", byID[429])

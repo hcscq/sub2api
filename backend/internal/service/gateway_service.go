@@ -53,13 +53,13 @@ const (
 	claudeCodeSystemPrompt = "You are Claude Code, Anthropic's official CLI for Claude."
 	maxCacheControlBlocks  = 4 // Anthropic API 允许的最大 cache_control 块数量
 
-	defaultUserGroupRateCacheTTL  = 30 * time.Second
-	defaultModelsListCacheTTL     = 15 * time.Second
-	antigravityRecentStatsWindow  = 15 * time.Minute
-	antigravityRecentStatsCacheTTL = 15 * time.Second
+	defaultUserGroupRateCacheTTL     = 30 * time.Second
+	defaultModelsListCacheTTL        = 15 * time.Second
+	antigravityRecentStatsWindow     = 15 * time.Minute
+	antigravityRecentStatsCacheTTL   = 15 * time.Second
 	antigravityWarmLoadBiasThreshold = 15
-	postUsageBillingTimeout       = 15 * time.Second
-	debugGatewayBodyEnv           = "SUB2API_DEBUG_GATEWAY_BODY"
+	postUsageBillingTimeout          = 15 * time.Second
+	debugGatewayBodyEnv              = "SUB2API_DEBUG_GATEWAY_BODY"
 )
 
 const (
@@ -646,42 +646,42 @@ func (s *GatewayService) TempUnscheduleRetryableError(ctx context.Context, accou
 
 // GatewayService handles API gateway operations
 type GatewayService struct {
-	accountRepo           AccountRepository
-	groupRepo             GroupRepository
-	usageLogRepo          UsageLogRepository
-	usageBillingRepo      UsageBillingRepository
-	userRepo              UserRepository
-	userSubRepo           UserSubscriptionRepository
-	userGroupRateRepo     UserGroupRateRepository
-	cache                 GatewayCache
-	digestStore           *DigestSessionStore
-	cfg                   *config.Config
-	schedulerSnapshot     *SchedulerSnapshotService
-	billingService        *BillingService
-	rateLimitService      *RateLimitService
-	billingCacheService   *BillingCacheService
-	identityService       *IdentityService
-	httpUpstream          HTTPUpstream
-	deferredService       *DeferredService
-	concurrencyService    *ConcurrencyService
-	claudeTokenProvider   *ClaudeTokenProvider
-	sessionLimitCache     SessionLimitCache // 会话数量限制缓存（仅 Anthropic OAuth/SetupToken）
-	rpmCache              RPMCache          // RPM 计数缓存（仅 Anthropic OAuth/SetupToken）
-	userGroupRateResolver *userGroupRateResolver
-	userGroupRateCache    *gocache.Cache
-	userGroupRateSF       singleflight.Group
-	modelsListCache       *gocache.Cache
-	modelsListCacheTTL    time.Duration
-	settingService        *SettingService
-	responseHeaderFilter  *responseheaders.CompiledHeaderFilter
-	debugModelRouting     atomic.Bool
-	debugClaudeMimic      atomic.Bool
-	channelService        *ChannelService
-	resolver              *ModelPricingResolver
-	debugGatewayBodyFile  atomic.Pointer[os.File] // non-nil when SUB2API_DEBUG_GATEWAY_BODY is set
-	tlsFPProfileService   *TLSFingerprintProfileService
-	balanceNotifyService       *BalanceNotifyService
-	antigravityRuntime         *antigravityAccountRuntimeStats
+	accountRepo                 AccountRepository
+	groupRepo                   GroupRepository
+	usageLogRepo                UsageLogRepository
+	usageBillingRepo            UsageBillingRepository
+	userRepo                    UserRepository
+	userSubRepo                 UserSubscriptionRepository
+	userGroupRateRepo           UserGroupRateRepository
+	cache                       GatewayCache
+	digestStore                 *DigestSessionStore
+	cfg                         *config.Config
+	schedulerSnapshot           *SchedulerSnapshotService
+	billingService              *BillingService
+	rateLimitService            *RateLimitService
+	billingCacheService         *BillingCacheService
+	identityService             *IdentityService
+	httpUpstream                HTTPUpstream
+	deferredService             *DeferredService
+	concurrencyService          *ConcurrencyService
+	claudeTokenProvider         *ClaudeTokenProvider
+	sessionLimitCache           SessionLimitCache // 会话数量限制缓存（仅 Anthropic OAuth/SetupToken）
+	rpmCache                    RPMCache          // RPM 计数缓存（仅 Anthropic OAuth/SetupToken）
+	userGroupRateResolver       *userGroupRateResolver
+	userGroupRateCache          *gocache.Cache
+	userGroupRateSF             singleflight.Group
+	modelsListCache             *gocache.Cache
+	modelsListCacheTTL          time.Duration
+	settingService              *SettingService
+	responseHeaderFilter        *responseheaders.CompiledHeaderFilter
+	debugModelRouting           atomic.Bool
+	debugClaudeMimic            atomic.Bool
+	channelService              *ChannelService
+	resolver                    *ModelPricingResolver
+	debugGatewayBodyFile        atomic.Pointer[os.File] // non-nil when SUB2API_DEBUG_GATEWAY_BODY is set
+	tlsFPProfileService         *TLSFingerprintProfileService
+	balanceNotifyService        *BalanceNotifyService
+	antigravityRuntime          *antigravityAccountRuntimeStats
 	antigravityRecentStatsCache *gocache.Cache
 }
 
@@ -718,37 +718,37 @@ func NewGatewayService(
 	modelsListTTL := resolveModelsListCacheTTL(cfg)
 
 	svc := &GatewayService{
-		accountRepo:          accountRepo,
-		groupRepo:            groupRepo,
-		usageLogRepo:         usageLogRepo,
-		usageBillingRepo:     usageBillingRepo,
-		userRepo:             userRepo,
-		userSubRepo:          userSubRepo,
-		userGroupRateRepo:    userGroupRateRepo,
-		cache:                cache,
-		digestStore:          digestStore,
-		cfg:                  cfg,
-		schedulerSnapshot:    schedulerSnapshot,
-		concurrencyService:   concurrencyService,
-		billingService:       billingService,
-		rateLimitService:     rateLimitService,
-		billingCacheService:  billingCacheService,
-		identityService:      identityService,
-		httpUpstream:         httpUpstream,
-		deferredService:      deferredService,
-		claudeTokenProvider:  claudeTokenProvider,
-		sessionLimitCache:    sessionLimitCache,
-		rpmCache:             rpmCache,
-		userGroupRateCache:   gocache.New(userGroupRateTTL, time.Minute),
-		settingService:       settingService,
-		modelsListCache:      gocache.New(modelsListTTL, time.Minute),
-		modelsListCacheTTL:   modelsListTTL,
-		responseHeaderFilter:  compileResponseHeaderFilter(cfg),
-		tlsFPProfileService:   tlsFPProfileService,
-		channelService:        channelService,
-		resolver:              resolver,
-		balanceNotifyService:  balanceNotifyService,
-		antigravityRuntime:    newAntigravityAccountRuntimeStats(),
+		accountRepo:                 accountRepo,
+		groupRepo:                   groupRepo,
+		usageLogRepo:                usageLogRepo,
+		usageBillingRepo:            usageBillingRepo,
+		userRepo:                    userRepo,
+		userSubRepo:                 userSubRepo,
+		userGroupRateRepo:           userGroupRateRepo,
+		cache:                       cache,
+		digestStore:                 digestStore,
+		cfg:                         cfg,
+		schedulerSnapshot:           schedulerSnapshot,
+		concurrencyService:          concurrencyService,
+		billingService:              billingService,
+		rateLimitService:            rateLimitService,
+		billingCacheService:         billingCacheService,
+		identityService:             identityService,
+		httpUpstream:                httpUpstream,
+		deferredService:             deferredService,
+		claudeTokenProvider:         claudeTokenProvider,
+		sessionLimitCache:           sessionLimitCache,
+		rpmCache:                    rpmCache,
+		userGroupRateCache:          gocache.New(userGroupRateTTL, time.Minute),
+		settingService:              settingService,
+		modelsListCache:             gocache.New(modelsListTTL, time.Minute),
+		modelsListCacheTTL:          modelsListTTL,
+		responseHeaderFilter:        compileResponseHeaderFilter(cfg),
+		tlsFPProfileService:         tlsFPProfileService,
+		channelService:              channelService,
+		resolver:                    resolver,
+		balanceNotifyService:        balanceNotifyService,
+		antigravityRuntime:          newAntigravityAccountRuntimeStats(),
 		antigravityRecentStatsCache: gocache.New(antigravityRecentStatsCacheTTL, time.Minute),
 	}
 	svc.userGroupRateResolver = newUserGroupRateResolver(
@@ -2589,10 +2589,19 @@ func (s *GatewayService) antigravityModelSelectionMode(ctx context.Context, acco
 	if !account.IsSchedulable() {
 		return antigravityModelSelectionUnavailable
 	}
+	if account.isAntigravityModelCapacityCoolingDownWithContext(ctx, requestedModel) {
+		return antigravityModelSelectionUnavailable
+	}
+	if account.isModelRateLimitedWithContext(ctx, requestedModel) {
+		if account.canUseAntigravityCreditsForModelWithContext(ctx, requestedModel) {
+			return antigravityModelSelectionCreditsFallback
+		}
+		return antigravityModelSelectionUnavailable
+	}
 	if !account.requiresAntigravityCreditsForModelWithContext(ctx, requestedModel) {
 		return antigravityModelSelectionDirect
 	}
-	if account.IsOveragesEnabled() && !account.isCreditsExhausted() {
+	if account.canUseAntigravityCreditsForModelWithContext(ctx, requestedModel) {
 		return antigravityModelSelectionCreditsFallback
 	}
 	return antigravityModelSelectionUnavailable
@@ -4350,22 +4359,24 @@ func (s *GatewayService) selectAccountWithMixedScheduling(ctx context.Context, g
 }
 
 type selectionFailureStats struct {
-	Total               int
-	Eligible            int
-	Excluded            int
-	Unschedulable       int
-	PlatformFiltered    int
-	ModelUnsupported    int
-	ModelRateLimited    int
-	QuotaExceeded       int
-	WindowCostLimited   int
-	RPMLimited          int
-	SamplePlatformIDs   []int64
-	SampleMappingIDs    []int64
-	SampleRateLimitIDs  []string
-	SampleQuotaIDs      []int64
-	SampleWindowCostIDs []int64
-	SampleRPMIDs        []int64
+	Total                          int
+	Eligible                       int
+	Excluded                       int
+	Unschedulable                  int
+	PlatformFiltered               int
+	ModelUnsupported               int
+	ModelCapacityCooldown          int
+	ModelRateLimited               int
+	QuotaExceeded                  int
+	WindowCostLimited              int
+	RPMLimited                     int
+	SamplePlatformIDs              []int64
+	SampleMappingIDs               []int64
+	SampleModelCapacityCooldownIDs []string
+	SampleRateLimitIDs             []string
+	SampleQuotaIDs                 []int64
+	SampleWindowCostIDs            []int64
+	SampleRPMIDs                   []int64
 }
 
 type selectionFailureDiagnosis struct {
@@ -4431,7 +4442,7 @@ func (s *GatewayService) logDetailedSelectionFailure(
 	stats := s.collectSelectionFailureStats(ctx, accounts, requestedModel, platform, excludedIDs, allowMixedScheduling)
 	logger.LegacyPrintf(
 		"service.gateway",
-		"[SelectAccountDetailed] group_id=%v model=%s platform=%s session=%s total=%d eligible=%d excluded=%d unschedulable=%d platform_filtered=%d model_unsupported=%d model_rate_limited=%d quota_exceeded=%d window_cost_limited=%d rpm_limited=%d sample_platform_filtered=%v sample_model_unsupported=%v sample_model_rate_limited=%v sample_quota_exceeded=%v sample_window_cost_limited=%v sample_rpm_limited=%v",
+		"[SelectAccountDetailed] group_id=%v model=%s platform=%s session=%s total=%d eligible=%d excluded=%d unschedulable=%d platform_filtered=%d model_unsupported=%d model_capacity_cooldown=%d model_rate_limited=%d quota_exceeded=%d window_cost_limited=%d rpm_limited=%d sample_platform_filtered=%v sample_model_unsupported=%v sample_model_capacity_cooldown=%v sample_model_rate_limited=%v sample_quota_exceeded=%v sample_window_cost_limited=%v sample_rpm_limited=%v",
 		derefGroupID(groupID),
 		requestedModel,
 		platform,
@@ -4442,12 +4453,14 @@ func (s *GatewayService) logDetailedSelectionFailure(
 		stats.Unschedulable,
 		stats.PlatformFiltered,
 		stats.ModelUnsupported,
+		stats.ModelCapacityCooldown,
 		stats.ModelRateLimited,
 		stats.QuotaExceeded,
 		stats.WindowCostLimited,
 		stats.RPMLimited,
 		stats.SamplePlatformIDs,
 		stats.SampleMappingIDs,
+		stats.SampleModelCapacityCooldownIDs,
 		stats.SampleRateLimitIDs,
 		stats.SampleQuotaIDs,
 		stats.SampleWindowCostIDs,
@@ -4482,6 +4495,10 @@ func (s *GatewayService) collectSelectionFailureStats(
 		case "model_unsupported":
 			stats.ModelUnsupported++
 			stats.SampleMappingIDs = appendSelectionFailureSampleID(stats.SampleMappingIDs, acc.ID)
+		case "model_capacity_cooldown":
+			stats.ModelCapacityCooldown++
+			remaining := acc.GetAntigravityModelCapacityCooldownRemainingWithContext(ctx, requestedModel).Truncate(time.Second)
+			stats.SampleModelCapacityCooldownIDs = appendSelectionFailureRateSample(stats.SampleModelCapacityCooldownIDs, acc.ID, remaining)
 		case "model_rate_limited":
 			stats.ModelRateLimited++
 			remaining := acc.GetRateLimitRemainingTimeWithContext(ctx, requestedModel).Truncate(time.Second)
@@ -4553,6 +4570,13 @@ func (s *GatewayService) diagnoseSelectionFailure(
 			Detail:   fmt.Sprintf("model=%s", requestedModel),
 		}
 	}
+	if acc.Platform == PlatformAntigravity && acc.isAntigravityModelCapacityCoolingDownWithContext(ctx, requestedModel) {
+		remaining := acc.GetAntigravityModelCapacityCooldownRemainingWithContext(ctx, requestedModel).Truncate(time.Second)
+		return selectionFailureDiagnosis{
+			Category: "model_capacity_cooldown",
+			Detail:   fmt.Sprintf("remaining=%s", remaining),
+		}
+	}
 	if !s.isAccountSchedulableForModelSelection(ctx, acc, requestedModel) {
 		remaining := acc.GetRateLimitRemainingTimeWithContext(ctx, requestedModel).Truncate(time.Second)
 		return selectionFailureDiagnosis{
@@ -4615,13 +4639,14 @@ func appendSelectionFailureRateSample(samples []string, accountID int64, remaini
 
 func summarizeSelectionFailureStats(stats selectionFailureStats) string {
 	return fmt.Sprintf(
-		"total=%d eligible=%d excluded=%d unschedulable=%d platform_filtered=%d model_unsupported=%d model_rate_limited=%d quota_exceeded=%d window_cost_limited=%d rpm_limited=%d",
+		"total=%d eligible=%d excluded=%d unschedulable=%d platform_filtered=%d model_unsupported=%d model_capacity_cooldown=%d model_rate_limited=%d quota_exceeded=%d window_cost_limited=%d rpm_limited=%d",
 		stats.Total,
 		stats.Eligible,
 		stats.Excluded,
 		stats.Unschedulable,
 		stats.PlatformFiltered,
 		stats.ModelUnsupported,
+		stats.ModelCapacityCooldown,
 		stats.ModelRateLimited,
 		stats.QuotaExceeded,
 		stats.WindowCostLimited,

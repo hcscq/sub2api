@@ -153,13 +153,23 @@ func (a *Account) isAntigravityCreditsOveragesActiveWithContext(ctx context.Cont
 	return a.getAntigravityCreditsOveragesRemainingByModelKey(modelKey) > 0
 }
 
+func (a *Account) canUseAntigravityCreditsForModelWithContext(ctx context.Context, requestedModel string) bool {
+	if a == nil || a.Platform != PlatformAntigravity {
+		return false
+	}
+	if !a.IsOveragesEnabled() || a.isCreditsExhausted() {
+		return false
+	}
+	return a.isAntigravityCreditsOveragesActiveWithContext(ctx, requestedModel)
+}
+
 func (a *Account) requiresAntigravityCreditsForModelWithContext(ctx context.Context, requestedModel string) bool {
 	if a == nil || a.Platform != PlatformAntigravity {
 		return false
 	}
-	if a.isModelRateLimitedWithContext(ctx, requestedModel) {
-		return true
-	}
+	// 只有当本模型已经确认切到 AI Credits 成功后，后续请求才继续走 credits fallback。
+	// 单纯的免费配额 429 只会在当前请求内尝试一次 credits；若 credits 也失败，则后续请求应切走其他账号，
+	// 避免同一账号在调度阶段被反复选中并持续返回 429。
 	return a.isAntigravityCreditsOveragesActiveWithContext(ctx, requestedModel)
 }
 

@@ -5,12 +5,14 @@ package service
 import (
 	"bytes"
 	"context"
-	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
-	"github.com/stretchr/testify/require"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
+	"github.com/stretchr/testify/require"
 )
 
 // stubSmartRetryCache 用于 handleSmartRetry 测试的 GatewayCache mock
@@ -410,8 +412,8 @@ func TestHandleSmartRetry_503_ModelCapacityExhausted_MultiAccountFastFailover(t 
 	require.Equal(t, "gemini-3-pro", result.switchError.RateLimitedModel)
 	require.True(t, result.switchError.IsStickySession)
 	require.True(t, result.switchError.ModelCapacityExhausted)
-	require.Len(t, repo.modelRateLimitCalls, 1, "fast failover should apply short model penalty")
-	require.Equal(t, "gemini-3-pro", repo.modelRateLimitCalls[0].modelKey)
+	require.Empty(t, repo.modelRateLimitCalls, "model capacity fast failover should not persist model_rate_limits")
+	require.Greater(t, account.GetAntigravityModelCapacityCooldownRemainingWithContext(context.Background(), "gemini-3-pro"), time.Duration(0))
 	require.Len(t, cache.deleteCalls, 1, "fast failover should clear sticky session binding")
 	require.Equal(t, int64(17), cache.deleteCalls[0].groupID)
 	require.Equal(t, "mce-fast-failover", cache.deleteCalls[0].sessionHash)
@@ -574,8 +576,8 @@ func TestHandleSmartRetry_ReclassifiesFinalModelCapacityExhausted(t *testing.T) 
 	require.Equal(t, "claude-opus-4-6-thinking", result.switchError.RateLimitedModel)
 	require.True(t, result.switchError.IsStickySession)
 	require.True(t, result.switchError.ModelCapacityExhausted)
-	require.Len(t, repo.modelRateLimitCalls, 1, "final model capacity exhausted should apply short model penalty")
-	require.Equal(t, "claude-opus-4-6-thinking", repo.modelRateLimitCalls[0].modelKey)
+	require.Empty(t, repo.modelRateLimitCalls, "final model capacity exhausted should not persist model_rate_limits")
+	require.Greater(t, account.GetAntigravityModelCapacityCooldownRemainingWithContext(context.Background(), "claude-opus-4-6-thinking"), time.Duration(0))
 	require.Len(t, cache.deleteCalls, 1, "final model capacity exhausted should clear sticky session binding")
 	require.Equal(t, int64(23), cache.deleteCalls[0].groupID)
 	require.Equal(t, "mce-final", cache.deleteCalls[0].sessionHash)
@@ -914,6 +916,53 @@ func TestAntigravityRetryLoop_HandleSmartRetry_SwitchError_Propagates(t *testing
 	require.Equal(t, account.ID, switchErr.OriginalAccountID)
 	require.Equal(t, "claude-opus-4-6", switchErr.RateLimitedModel)
 	require.True(t, switchErr.IsStickySession)
+}
+
+func TestAntigravityRetryLoop_ModelCapacityCooldownPrecheck_SwitchesWithoutUpstream(t *testing.T) {
+	resetModelCapacityExhaustedStateForTest(t)
+
+	account := &Account{
+		ID:          71,
+		Name:        "acc-71",
+		Type:        AccountTypeOAuth,
+		Platform:    PlatformAntigravity,
+		Schedulable: true,
+		Status:      StatusActive,
+	}
+	finalModelKey := normalizeAntigravityModelCapacityCooldownKey(context.Background(), account, "claude-opus-4-6")
+	_, ok := setAntigravityModelCapacityCooldown(account.ID, finalModelKey, 5*time.Second)
+	require.True(t, ok)
+
+	upstream := &mockSmartRetryUpstream{}
+	cache := &stubSmartRetryCache{}
+	svc := &AntigravityGatewayService{cache: cache}
+	result, err := svc.antigravityRetryLoop(antigravityRetryLoopParams{
+		ctx:             context.Background(),
+		prefix:          "[test]",
+		account:         account,
+		accessToken:     "token",
+		action:          "generateContent",
+		body:            []byte(`{"input":"test"}`),
+		httpUpstream:    upstream,
+		requestedModel:  "claude-opus-4-6",
+		groupID:         55,
+		sessionHash:     "cooldown-precheck",
+		isStickySession: true,
+		handleError: func(ctx context.Context, prefix string, account *Account, statusCode int, headers http.Header, body []byte, requestedModel string, groupID int64, sessionHash string, isStickySession bool) *handleModelRateLimitResult {
+			return nil
+		},
+	})
+
+	require.Nil(t, result)
+	require.Error(t, err)
+	var switchErr *AntigravityAccountSwitchError
+	require.ErrorAs(t, err, &switchErr)
+	require.True(t, switchErr.ModelCapacityExhausted)
+	require.Equal(t, finalModelKey, switchErr.RateLimitedModel)
+	require.Len(t, upstream.calls, 0, "runtime cooldown should short-circuit before upstream request")
+	require.Len(t, cache.deleteCalls, 1, "runtime cooldown should clear sticky session binding")
+	require.Equal(t, int64(55), cache.deleteCalls[0].groupID)
+	require.Equal(t, "cooldown-precheck", cache.deleteCalls[0].sessionHash)
 }
 
 // TestHandleSmartRetry_NetworkError_ExhaustsRetry 测试网络错误时（maxAttempts=1）直接耗尽重试并切换账号

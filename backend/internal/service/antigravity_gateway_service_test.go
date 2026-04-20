@@ -445,10 +445,12 @@ func TestAntigravityGatewayService_Forward_ModelCapacityExhaustedMarksFailover(t
 	modelCapacityExhaustedMu.Lock()
 	delete(modelCapacityExhaustedUntil, "claude-sonnet-4-5")
 	modelCapacityExhaustedMu.Unlock()
+	clearAntigravityModelCapacityCooldown(account.ID, "claude-sonnet-4-5")
 	t.Cleanup(func() {
 		modelCapacityExhaustedMu.Lock()
 		delete(modelCapacityExhaustedUntil, "claude-sonnet-4-5")
 		modelCapacityExhaustedMu.Unlock()
+		clearAntigravityModelCapacityCooldown(account.ID, "claude-sonnet-4-5")
 	})
 
 	result, err := svc.Forward(context.Background(), c, account, body, false)
@@ -459,6 +461,7 @@ func TestAntigravityGatewayService_Forward_ModelCapacityExhaustedMarksFailover(t
 	require.ErrorAs(t, err, &failoverErr)
 	require.Equal(t, http.StatusServiceUnavailable, failoverErr.StatusCode)
 	require.True(t, failoverErr.ModelCapacityExhausted)
+	require.Greater(t, account.GetAntigravityModelCapacityCooldownRemainingWithContext(context.Background(), "claude-sonnet-4-5"), time.Duration(0))
 }
 
 func TestAntigravityGatewayService_ForwardGemini_ModelCapacityExhaustedMarksFailover(t *testing.T) {
@@ -509,10 +512,12 @@ func TestAntigravityGatewayService_ForwardGemini_ModelCapacityExhaustedMarksFail
 	modelCapacityExhaustedMu.Lock()
 	delete(modelCapacityExhaustedUntil, "gemini-2.5-flash")
 	modelCapacityExhaustedMu.Unlock()
+	clearAntigravityModelCapacityCooldown(account.ID, "gemini-2.5-flash")
 	t.Cleanup(func() {
 		modelCapacityExhaustedMu.Lock()
 		delete(modelCapacityExhaustedUntil, "gemini-2.5-flash")
 		modelCapacityExhaustedMu.Unlock()
+		clearAntigravityModelCapacityCooldown(account.ID, "gemini-2.5-flash")
 	})
 
 	result, err := svc.ForwardGemini(context.Background(), c, account, "gemini-2.5-flash", "generateContent", false, body, false)
@@ -523,6 +528,7 @@ func TestAntigravityGatewayService_ForwardGemini_ModelCapacityExhaustedMarksFail
 	require.ErrorAs(t, err, &failoverErr)
 	require.Equal(t, http.StatusServiceUnavailable, failoverErr.StatusCode)
 	require.True(t, failoverErr.ModelCapacityExhausted)
+	require.Greater(t, account.GetAntigravityModelCapacityCooldownRemainingWithContext(context.Background(), "gemini-2.5-flash"), time.Duration(0))
 }
 
 // TestAntigravityGatewayService_Forward_StickySessionForceCacheBilling

@@ -32,11 +32,11 @@ func (a *Account) IsSchedulableForModelWithContext(ctx context.Context, requeste
 		return false
 	}
 	if a.Platform == PlatformAntigravity && a.requiresAntigravityCreditsForModelWithContext(ctx, requestedModel) {
-		return a.IsOveragesEnabled() && !a.isCreditsExhausted()
+		return a.canUseAntigravityCreditsForModelWithContext(ctx, requestedModel)
 	}
 	if a.isModelRateLimitedWithContext(ctx, requestedModel) {
-		// Antigravity + overages 启用 + 积分未耗尽 → 放行（有积分可用）
-		if a.Platform == PlatformAntigravity && a.IsOveragesEnabled() && !a.isCreditsExhausted() {
+		// Antigravity 只有在当前模型已经成功切到 AI Credits 后，才允许继续作为 credits fallback 调度。
+		if a.Platform == PlatformAntigravity && a.canUseAntigravityCreditsForModelWithContext(ctx, requestedModel) {
 			return true
 		}
 		return false

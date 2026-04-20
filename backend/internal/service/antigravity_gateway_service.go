@@ -47,7 +47,6 @@ const (
 	// Handler 层做有限跨账号 failover，避免直接把瞬时容量抖动暴露给下游。
 	antigravityModelCapacityRetryMaxAttempts = 3
 	antigravityModelCapacityRetryWait        = 1 * time.Second
-	antigravityModelCapacityFailoverPenalty  = 15 * time.Second
 
 	// Google RPC 状态和类型常量
 	googleRPCStatusResourceExhausted      = "RESOURCE_EXHAUSTED"
@@ -265,8 +264,8 @@ func (s *AntigravityGatewayService) handleSmartRetry(p antigravityRetryLoopParam
 		if shouldPreferAntigravityFastFailover(p.ctx, isModelCapacityExhausted) {
 			if isModelCapacityExhausted {
 				switchCount, _ := AccountSwitchCountFromContext(p.ctx)
-				logger.LegacyPrintf("service.antigravity_gateway", "%s status=%d model_capacity_fast_failover model=%s account=%d switch_count=%d penalty=%v body=%s (skip in-service retry, switch account)",
-					p.prefix, resp.StatusCode, modelName, p.account.ID, switchCount, antigravityModelCapacityFailoverPenalty, truncateForLog(respBody, 200))
+				logger.LegacyPrintf("service.antigravity_gateway", "%s status=%d model_capacity_fast_failover model=%s account=%d switch_count=%d cooldown=%v body=%s (skip in-service retry, switch account)",
+					p.prefix, resp.StatusCode, modelName, p.account.ID, switchCount, antigravityModelCapacityAccountCooldown, truncateForLog(respBody, 200))
 				return &smartRetryResult{
 					action:      smartRetryActionBreakWithResp,
 					switchError: s.buildModelCapacitySwitchError(p, resp.StatusCode, modelName, false),
@@ -364,6 +363,7 @@ func (s *AntigravityGatewayService) handleSmartRetry(p antigravityRetryLoopParam
 					modelCapacityExhaustedMu.Lock()
 					delete(modelCapacityExhaustedUntil, modelName)
 					modelCapacityExhaustedMu.Unlock()
+					clearAntigravityModelCapacityCooldown(p.account.ID, modelName)
 				}
 				return &smartRetryResult{action: smartRetryActionBreakWithResp, resp: retryResp}
 			}
@@ -444,8 +444,8 @@ func (s *AntigravityGatewayService) handleSmartRetry(p antigravityRetryLoopParam
 					},
 				}
 			}
-			log.Printf("%s status=%d smart_retry_exhausted_model_capacity attempts=%d model=%s account=%d penalty=%v body=%s (switch account)",
-				p.prefix, finalStatusCode, maxAttempts, finalModelName, p.account.ID, antigravityModelCapacityFailoverPenalty, truncateForLog(retryBody, 200))
+			log.Printf("%s status=%d smart_retry_exhausted_model_capacity attempts=%d model=%s account=%d cooldown=%v body=%s (switch account)",
+				p.prefix, finalStatusCode, maxAttempts, finalModelName, p.account.ID, antigravityModelCapacityAccountCooldown, truncateForLog(retryBody, 200))
 			return &smartRetryResult{
 				action:      smartRetryActionBreakWithResp,
 				switchError: s.buildModelCapacitySwitchError(p, finalStatusCode, finalModelName, true),
@@ -518,9 +518,17 @@ func (s *AntigravityGatewayService) buildModelCapacitySwitchError(
 	modelName string,
 	afterSmartRetry bool,
 ) *AntigravityAccountSwitchError {
-	resetAt := time.Now().Add(antigravityModelCapacityFailoverPenalty)
-	if setModelRateLimitByModelName(p.ctx, p.accountRepo, p.account.ID, modelName, p.prefix, statusCode, resetAt, afterSmartRetry) {
-		s.updateAccountModelRateLimitInCache(p.ctx, p.account, modelName, resetAt)
+	if strings.TrimSpace(modelName) == "" {
+		modelName = normalizeAntigravityModelCapacityCooldownKey(p.ctx, p.account, p.requestedModel)
+	}
+	if resetAt, ok := setAntigravityModelCapacityCooldown(p.account.ID, modelName, antigravityModelCapacityAccountCooldown); ok {
+		if afterSmartRetry {
+			logger.LegacyPrintf("service.antigravity_gateway", "%s status=%d model_capacity_cooldown_after_smart_retry model=%s account=%d reset_in=%v",
+				p.prefix, statusCode, modelName, p.account.ID, time.Until(resetAt).Truncate(time.Second))
+		} else {
+			logger.LegacyPrintf("service.antigravity_gateway", "%s status=%d model_capacity_cooldown model=%s account=%d reset_in=%v",
+				p.prefix, statusCode, modelName, p.account.ID, time.Until(resetAt).Truncate(time.Second))
+		}
 	}
 	if s.cache != nil && p.sessionHash != "" {
 		_ = s.cache.DeleteSessionAccountID(p.ctx, p.groupID, p.sessionHash)
@@ -663,11 +671,35 @@ func (s *AntigravityGatewayService) handleSingleAccountRetryInPlace(
 
 // antigravityRetryLoop 执行带 URL fallback 的重试循环
 func (s *AntigravityGatewayService) antigravityRetryLoop(p antigravityRetryLoopParams) (*antigravityRetryLoopResult, error) {
-	// 预检查：模型限流 + overages 启用 + 积分未耗尽 → 直接注入 AI Credits
+	if p.requestedModel != "" && p.account.Platform == PlatformAntigravity {
+		if remaining := p.account.GetAntigravityModelCapacityCooldownRemainingWithContext(p.ctx, p.requestedModel); remaining > 0 {
+			if isSingleAccountRetry(p.ctx) {
+				logger.LegacyPrintf("service.antigravity_gateway", "%s pre_check: single_account_retry skipping model_capacity_cooldown remaining=%v model=%s account=%d",
+					p.prefix, remaining.Truncate(time.Millisecond), p.requestedModel, p.account.ID)
+			} else {
+				modelKey := normalizeAntigravityModelCapacityCooldownKey(p.ctx, p.account, p.requestedModel)
+				if modelKey == "" {
+					modelKey = normalizeAntigravityModelName(p.requestedModel)
+				}
+				logger.LegacyPrintf("service.antigravity_gateway", "%s pre_check: model_capacity_cooldown_switch remaining=%v model=%s account=%d",
+					p.prefix, remaining.Truncate(time.Millisecond), modelKey, p.account.ID)
+				if s.cache != nil && p.sessionHash != "" {
+					_ = s.cache.DeleteSessionAccountID(p.ctx, p.groupID, p.sessionHash)
+				}
+				return nil, &AntigravityAccountSwitchError{
+					OriginalAccountID:      p.account.ID,
+					RateLimitedModel:       modelKey,
+					IsStickySession:        p.isStickySession,
+					ModelCapacityExhausted: true,
+				}
+			}
+		}
+	}
+
+	// 预检查：仅当该模型已经成功切到 AI Credits 后，才继续预注入 enabledCreditTypes。
 	overagesInjected := false
 	if p.requestedModel != "" && p.account.Platform == PlatformAntigravity &&
-		p.account.IsOveragesEnabled() && !p.account.isCreditsExhausted() &&
-		p.account.requiresAntigravityCreditsForModelWithContext(p.ctx, p.requestedModel) {
+		p.account.canUseAntigravityCreditsForModelWithContext(p.ctx, p.requestedModel) {
 		if creditsBody := injectEnabledCreditTypes(p.body); creditsBody != nil {
 			p.body = creditsBody
 			overagesInjected = true
@@ -1198,6 +1230,9 @@ func (s *AntigravityGatewayService) TestConnection(ctx context.Context, account 
 		// AccountSwitchError → 测试时不切换账号，返回友好提示
 		var switchErr *AntigravityAccountSwitchError
 		if errors.As(err, &switchErr) {
+			if switchErr.ModelCapacityExhausted {
+				return nil, fmt.Errorf("该账号模型 %s 当前容量紧张，已进入短暂避让，请稍后重试", switchErr.RateLimitedModel)
+			}
 			return nil, fmt.Errorf("该账号模型 %s 当前限流中，请稍后重试", switchErr.RateLimitedModel)
 		}
 		return nil, err

@@ -258,7 +258,7 @@ func TestHandleSmartRetry_RateLimited_DoesNotUseCredits(t *testing.T) {
 	require.Empty(t, repo.modelRateLimitCalls)
 }
 
-func TestAntigravityRetryLoop_ModelRateLimited_InjectsCredits(t *testing.T) {
+func TestAntigravityRetryLoop_ModelRateLimitedWithoutActiveOverages_SwitchesWithoutInject(t *testing.T) {
 	oldBaseURLs := append([]string(nil), antigravity.BaseURLs...)
 	oldAvailability := antigravity.DefaultURLAvailability
 	defer func() {
@@ -279,7 +279,7 @@ func TestAntigravityRetryLoop_ModelRateLimited_InjectsCredits(t *testing.T) {
 		},
 		errors: []error{nil},
 	}
-	// 模型已限流 + overages 启用 + 无 AICredits key → 应直接注入积分
+	// 模型已限流但当前模型未激活 credits overages → 不应继续注入积分，应直接切号。
 	account := &Account{
 		ID:          103,
 		Name:        "acc-103",
@@ -299,7 +299,7 @@ func TestAntigravityRetryLoop_ModelRateLimited_InjectsCredits(t *testing.T) {
 	}
 
 	svc := &AntigravityGatewayService{}
-	result, err := svc.antigravityRetryLoop(antigravityRetryLoopParams{
+	_, err := svc.antigravityRetryLoop(antigravityRetryLoopParams{
 		ctx:            context.Background(),
 		prefix:         "[test]",
 		account:        account,
@@ -313,10 +313,10 @@ func TestAntigravityRetryLoop_ModelRateLimited_InjectsCredits(t *testing.T) {
 		},
 	})
 
-	require.NoError(t, err)
-	require.NotNil(t, result)
-	require.Len(t, upstream.requestBodies, 1)
-	require.Contains(t, string(upstream.requestBodies[0]), "enabledCreditTypes")
+	require.Error(t, err)
+	var switchErr *AntigravityAccountSwitchError
+	require.ErrorAs(t, err, &switchErr)
+	require.Empty(t, upstream.requestBodies, "模型限流但未激活 overages 时不应发起 credits 注入请求")
 }
 
 func TestAntigravityRetryLoop_CreditsOveragesActive_InjectsCredits(t *testing.T) {
@@ -470,7 +470,7 @@ func TestAntigravityRetryLoop_CreditErrorMarksExhausted(t *testing.T) {
 		},
 		errors: []error{nil},
 	}
-	// 模型限流 + overages 启用 + 积分可用 → 注入积分但上游返回积分不足
+	// 已激活 overages 的 credits 请求失败时，应标记 AICredits 耗尽。
 	account := &Account{
 		ID:          105,
 		Name:        "acc-105",
@@ -480,11 +480,11 @@ func TestAntigravityRetryLoop_CreditErrorMarksExhausted(t *testing.T) {
 		Schedulable: true,
 		Extra: map[string]any{
 			"allow_overages": true,
-			modelRateLimitsKey: map[string]any{
-				"claude-sonnet-4-5": map[string]any{
-					"rate_limited_at":     time.Now().UTC().Format(time.RFC3339),
-					"rate_limit_reset_at": time.Now().Add(30 * time.Minute).UTC().Format(time.RFC3339),
-				},
+			buildAntigravityCreditsOveragesExtraKey("claude-sonnet-4-5"): map[string]any{
+				creditsActivatedAtField:   time.Now().UTC().Format(time.RFC3339),
+				creditsLastSuccessAtField: time.Now().UTC().Format(time.RFC3339),
+				creditsActiveUntilField:   time.Now().Add(30 * time.Minute).UTC().Format(time.RFC3339),
+				creditsReasonField:        creditsOveragesActiveReason,
 			},
 		},
 	}
@@ -936,6 +936,29 @@ func TestAntigravityModelSelectionMode_CreditsOveragesActiveUsesFallback(t *test
 	svc := &GatewayService{}
 	mode := svc.antigravityModelSelectionMode(context.Background(), account, "claude-sonnet-4-6")
 	require.Equal(t, antigravityModelSelectionCreditsFallback, mode)
+}
+
+func TestAntigravityModelSelectionMode_ModelRateLimitedWithoutOveragesActiveIsUnavailable(t *testing.T) {
+	now := time.Now()
+	account := &Account{
+		ID:          90,
+		Platform:    PlatformAntigravity,
+		Status:      StatusActive,
+		Schedulable: true,
+		Extra: map[string]any{
+			"allow_overages": true,
+			modelRateLimitsKey: map[string]any{
+				"claude-sonnet-4-6": map[string]any{
+					"rate_limited_at":     now.UTC().Format(time.RFC3339),
+					"rate_limit_reset_at": now.Add(30 * time.Minute).UTC().Format(time.RFC3339),
+				},
+			},
+		},
+	}
+
+	svc := &GatewayService{}
+	mode := svc.antigravityModelSelectionMode(context.Background(), account, "claude-sonnet-4-6")
+	require.Equal(t, antigravityModelSelectionUnavailable, mode)
 }
 
 func TestPreferDirectAntigravityAccounts_PrefersDirectOverOveragesActive(t *testing.T) {
