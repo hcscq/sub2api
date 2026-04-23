@@ -63,16 +63,6 @@ func ReadUpstreamResponseBody(reader io.Reader, cfg *config.Config, c *gin.Conte
 	return body, nil
 }
 
-func anthropicTooLargeError(c *gin.Context) {
-	c.JSON(http.StatusBadGateway, gin.H{
-		"type": "error",
-		"error": gin.H{
-			"type":    "upstream_error",
-			"message": "Upstream response too large",
-		},
-	})
-}
-
 func openAITooLargeError(c *gin.Context) {
 	c.JSON(http.StatusBadGateway, gin.H{
 		"error": gin.H{

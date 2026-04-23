@@ -2106,9 +2106,6 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 			// 6. LRU 选择最久未用的账号
 			selected := selectByLRU(candidates, preferOAuth)
 			if selected == nil {
-				if platform == PlatformAntigravity {
-					antigravityRounds = append(antigravityRounds, traceRound)
-				}
 				break
 			}
 			if platform == PlatformAntigravity {
