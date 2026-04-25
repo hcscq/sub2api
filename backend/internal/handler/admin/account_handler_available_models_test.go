@@ -29,8 +29,43 @@ func setupAvailableModelsRouter(adminSvc service.AdminService) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	handler := NewAccountHandler(adminSvc, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	router.GET("/api/v1/admin/accounts/model-options", handler.GetModelOptions)
 	router.GET("/api/v1/admin/accounts/:id/models", handler.GetAvailableModels)
 	return router
+}
+
+func TestAccountHandlerGetModelOptions_OpenAIIncludesGPT55(t *testing.T) {
+	router := setupAvailableModelsRouter(newStubAdminService())
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/accounts/model-options?platform=openai", nil)
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var resp struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.Contains(t, func() []string {
+		ids := make([]string, 0, len(resp.Data))
+		for _, model := range resp.Data {
+			ids = append(ids, model.ID)
+		}
+		return ids
+	}(), "gpt-5.5")
+}
+
+func TestAccountHandlerGetModelOptions_InvalidPlatform(t *testing.T) {
+	router := setupAvailableModelsRouter(newStubAdminService())
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/accounts/model-options?platform=unknown", nil)
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
 func TestAccountHandlerGetAvailableModels_OpenAIOAuthUsesExplicitModelMapping(t *testing.T) {

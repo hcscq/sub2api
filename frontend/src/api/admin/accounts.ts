@@ -6,6 +6,7 @@
 import { apiClient } from '../client'
 import type {
   Account,
+  AccountPlatform,
   CreateAccountRequest,
   UpdateAccountRequest,
   PaginatedResponse,
@@ -441,6 +442,23 @@ export async function getAvailableModels(id: number): Promise<ClaudeModel[]> {
   return data
 }
 
+/**
+ * Get selectable model options for a platform.
+ * Used by create/edit dialogs to avoid frontend hardcoded model lists.
+ */
+export async function getModelOptions(
+  platform: AccountPlatform,
+  options?: {
+    signal?: AbortSignal
+  }
+): Promise<ClaudeModel[]> {
+  const { data } = await apiClient.get<ClaudeModel[]>('/admin/accounts/model-options', {
+    params: { platform },
+    signal: options?.signal
+  })
+  return data
+}
+
 export interface CRSPreviewAccount {
   crs_account_id: string
   kind: string
@@ -650,6 +668,7 @@ export const accountsAPI = {
   resetTempUnschedulable,
   setSchedulable,
   getAvailableModels,
+  getModelOptions,
   generateAuthUrl,
   exchangeCode,
   refreshOpenAIToken,

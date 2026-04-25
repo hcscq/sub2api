@@ -963,7 +963,11 @@
 
             <!-- Whitelist Mode -->
             <div v-if="modelRestrictionMode === 'whitelist'">
-              <ModelWhitelistSelector v-model="allowedModels" :platform="form.platform" />
+              <ModelWhitelistSelector
+                v-model="allowedModels"
+                :platform="form.platform"
+                :available-models="availableModelOptions"
+              />
               <p class="text-xs text-gray-500 dark:text-gray-400">
                 {{ t('admin.accounts.selectedModels', { count: allowedModels.length }) }}
                 <span v-if="allowedModels.length === 0">{{
@@ -1389,7 +1393,11 @@
 
           <!-- Whitelist Mode -->
           <div v-if="modelRestrictionMode === 'whitelist'">
-            <ModelWhitelistSelector v-model="allowedModels" platform="anthropic" />
+            <ModelWhitelistSelector
+              v-model="allowedModels"
+              platform="anthropic"
+              :available-models="availableModelOptions"
+            />
             <p class="text-xs text-gray-500 dark:text-gray-400">
               {{ t('admin.accounts.selectedModels', { count: allowedModels.length }) }}
               <span v-if="allowedModels.length === 0">{{ t('admin.accounts.supportsAllModels') }}</span>
@@ -1628,7 +1636,11 @@
 
           <!-- Whitelist Mode -->
           <div v-if="modelRestrictionMode === 'whitelist'">
-            <ModelWhitelistSelector v-model="allowedModels" :platform="form.platform" />
+            <ModelWhitelistSelector
+              v-model="allowedModels"
+              :platform="form.platform"
+              :available-models="availableModelOptions"
+            />
             <p class="text-xs text-gray-500 dark:text-gray-400">
               {{ t('admin.accounts.selectedModels', { count: allowedModels.length }) }}
               <span v-if="allowedModels.length === 0">{{
@@ -2932,9 +2944,7 @@ import { ref, reactive, computed, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useAppStore } from '@/stores/app'
 import {
-  claudeModels,
   getPresetMappingsByPlatform,
-  getModelsByPlatform,
   commonErrorCodes,
   buildModelMappingObject,
   fetchAntigravityDefaultMappings,
@@ -2957,6 +2967,7 @@ import type {
   AccountPlatform,
   AccountType,
   CheckMixedChannelResponse,
+  ClaudeModel,
   CreateAccountRequest,
   OpenAICompactMode
 } from '@/types'
@@ -3102,6 +3113,7 @@ const modelMappings = ref<ModelMapping[]>([])
 const openAICompactModelMappings = ref<ModelMapping[]>([])
 const modelRestrictionMode = ref<'whitelist' | 'mapping'>('whitelist')
 const allowedModels = ref<string[]>([])
+const availableModelOptions = ref<string[]>([])
 const DEFAULT_POOL_MODE_RETRY_COUNT = 3
 const MAX_POOL_MODE_RETRY_COUNT = 10
 const poolModeEnabled = ref(false)
@@ -3157,6 +3169,8 @@ const getModelMappingKey = createStableObjectKeyResolver<ModelMapping>('create-m
 const getOpenAICompactModelMappingKey = createStableObjectKeyResolver<ModelMapping>('create-openai-compact-model-mapping')
 const getAntigravityModelMappingKey = createStableObjectKeyResolver<ModelMapping>('create-antigravity-model-mapping')
 const getTempUnschedRuleKey = createStableObjectKeyResolver<TempUnschedRuleForm>('create-temp-unsched-rule')
+const pendingModelWhitelistAutofill = ref(false)
+let availableModelOptionsRequestSeq = 0
 const geminiOAuthType = ref<'code_assist' | 'google_one' | 'ai_studio'>('google_one')
 const geminiAIStudioOAuthEnabled = ref(false)
 const openAICompactModeOptions = computed(() => [
@@ -3367,6 +3381,55 @@ const canExchangeCode = computed(() => {
   return authCode.trim() && oauth.sessionId.value && !oauth.loading.value
 })
 
+const extractModelOptionIDs = (models: ClaudeModel[]) => {
+  const seen = new Set<string>()
+  const ids: string[] = []
+  for (const model of models) {
+    const id = model.id?.trim()
+    if (!id || seen.has(id)) {
+      continue
+    }
+    seen.add(id)
+    ids.push(id)
+  }
+  return ids
+}
+
+const applyPendingModelWhitelistAutofill = () => {
+  if (!props.show || !pendingModelWhitelistAutofill.value || modelRestrictionMode.value !== 'whitelist') {
+    return
+  }
+
+  pendingModelWhitelistAutofill.value = false
+  allowedModels.value = [...availableModelOptions.value]
+}
+
+const loadAvailableModelOptions = async (platform: AccountPlatform) => {
+  if (!props.show) {
+    return
+  }
+
+  const requestSeq = ++availableModelOptionsRequestSeq
+
+  try {
+    const models = await adminAPI.accounts.getModelOptions(platform)
+    if (!props.show || requestSeq !== availableModelOptionsRequestSeq || form.platform !== platform) {
+      return
+    }
+
+    availableModelOptions.value = extractModelOptionIDs(models)
+    applyPendingModelWhitelistAutofill()
+  } catch (error: any) {
+    if (!props.show || requestSeq !== availableModelOptionsRequestSeq || form.platform !== platform) {
+      return
+    }
+
+    availableModelOptions.value = []
+    pendingModelWhitelistAutofill.value = false
+    appStore.showError(error.response?.data?.message || error.response?.data?.detail || t('admin.accounts.failedToLoad'))
+  }
+}
+
 // Watchers
 watch(
   () => props.show,
@@ -3376,8 +3439,8 @@ watch(
       adminAPI.tlsFingerprintProfiles.list()
         .then(profiles => { tlsFingerprintProfiles.value = profiles.map(p => ({ id: p.id, name: p.name })) })
         .catch(() => { tlsFingerprintProfiles.value = [] })
-      // Modal opened - fill related models
-      allowedModels.value = [...getModelsByPlatform(form.platform)]
+      pendingModelWhitelistAutofill.value = modelRestrictionMode.value === 'whitelist'
+      loadAvailableModelOptions(form.platform)
       // Antigravity: 默认使用映射模式并填充默认映射
       if (form.platform === 'antigravity') {
         antigravityModelRestrictionMode.value = 'mapping'
@@ -3431,8 +3494,15 @@ watch(
           ? 'https://generativelanguage.googleapis.com'
           : 'https://api.anthropic.com'
     // Clear model-related settings
+    availableModelOptionsRequestSeq += 1
+    availableModelOptions.value = []
+    pendingModelWhitelistAutofill.value = false
     allowedModels.value = []
     modelMappings.value = []
+    if (props.show) {
+      pendingModelWhitelistAutofill.value = modelRestrictionMode.value === 'whitelist'
+      loadAvailableModelOptions(newPlatform)
+    }
     // Antigravity: 默认使用映射模式并填充默认映射
     if (newPlatform === 'antigravity') {
       antigravityModelRestrictionMode.value = 'mapping'
@@ -3519,11 +3589,25 @@ const handleSelectGeminiOAuthType = (oauthType: 'code_assist' | 'google_one' | '
 
 // Auto-fill related models when switching to whitelist mode or changing platform
 watch(
-  [modelRestrictionMode, () => form.platform],
-  ([newMode]) => {
-    if (newMode === 'whitelist') {
-      allowedModels.value = [...getModelsByPlatform(form.platform)]
+  modelRestrictionMode,
+  (newMode) => {
+    if (!props.show) {
+      return
     }
+
+    if (newMode === 'whitelist') {
+      if (availableModelOptions.value.length > 0) {
+        pendingModelWhitelistAutofill.value = false
+        allowedModels.value = [...availableModelOptions.value]
+        return
+      }
+
+      pendingModelWhitelistAutofill.value = true
+      loadAvailableModelOptions(form.platform)
+      return
+    }
+
+    pendingModelWhitelistAutofill.value = false
   }
 )
 
@@ -3843,7 +3927,10 @@ const resetForm = () => {
   modelMappings.value = []
   openAICompactModelMappings.value = []
   modelRestrictionMode.value = 'whitelist'
-  allowedModels.value = [...claudeModels] // Default fill related models
+  allowedModels.value = []
+  availableModelOptions.value = []
+  pendingModelWhitelistAutofill.value = false
+  availableModelOptionsRequestSeq += 1
 
   antigravityModelRestrictionMode.value = 'mapping'
   antigravityWhitelistModels.value = []

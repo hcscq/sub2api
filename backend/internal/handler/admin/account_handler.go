@@ -1810,6 +1810,73 @@ func (h *AccountHandler) SetSchedulable(c *gin.Context) {
 	response.Success(c, h.buildAccountResponseWithRuntime(c.Request.Context(), account))
 }
 
+func buildModelOptionsForPlatform(platform string) ([]claude.Model, error) {
+	switch strings.ToLower(strings.TrimSpace(platform)) {
+	case service.PlatformOpenAI:
+		models := make([]claude.Model, 0, len(openai.DefaultModels))
+		for _, model := range openai.DefaultModels {
+			createdAt := ""
+			if model.Created > 0 {
+				createdAt = time.Unix(model.Created, 0).UTC().Format(time.RFC3339)
+			}
+			models = append(models, claude.Model{
+				ID:          model.ID,
+				Type:        "model",
+				DisplayName: model.DisplayName,
+				CreatedAt:   createdAt,
+			})
+		}
+		return models, nil
+	case service.PlatformGemini:
+		models := make([]claude.Model, 0, len(geminicli.DefaultModels))
+		for _, model := range geminicli.DefaultModels {
+			models = append(models, claude.Model{
+				ID:          model.ID,
+				Type:        model.Type,
+				DisplayName: model.DisplayName,
+				CreatedAt:   model.CreatedAt,
+			})
+		}
+		return models, nil
+	case service.PlatformAntigravity:
+		source := antigravity.DefaultModels()
+		models := make([]claude.Model, 0, len(source))
+		for _, model := range source {
+			models = append(models, claude.Model{
+				ID:          model.ID,
+				Type:        model.Type,
+				DisplayName: model.DisplayName,
+				CreatedAt:   model.CreatedAt,
+			})
+		}
+		return models, nil
+	case service.PlatformAnthropic, "claude":
+		models := make([]claude.Model, 0, len(claude.DefaultModels))
+		models = append(models, claude.DefaultModels...)
+		return models, nil
+	default:
+		return nil, fmt.Errorf("unsupported platform: %s", platform)
+	}
+}
+
+// GetModelOptions handles getting selectable model options for a platform.
+// GET /api/v1/admin/accounts/model-options?platform=openai
+func (h *AccountHandler) GetModelOptions(c *gin.Context) {
+	platform := strings.TrimSpace(c.Query("platform"))
+	if platform == "" {
+		response.BadRequest(c, "platform is required")
+		return
+	}
+
+	models, err := buildModelOptionsForPlatform(platform)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	response.Success(c, models)
+}
+
 // GetAvailableModels handles getting available models for an account
 // GET /api/v1/admin/accounts/:id/models
 func (h *AccountHandler) GetAvailableModels(c *gin.Context) {

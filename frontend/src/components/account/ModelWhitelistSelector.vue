@@ -133,6 +133,7 @@ const props = defineProps<{
   modelValue: string[]
   platform?: string
   platforms?: string[]
+  availableModels?: string[]
 }>()
 
 const emit = defineEmits<{
@@ -162,9 +163,67 @@ const normalizedPlatforms = computed(() => {
   )
 })
 
+const explicitOptions = computed(() => {
+  if (props.availableModels === undefined) {
+    return null
+  }
+
+  const seen = new Set<string>()
+  const options: Array<{ value: string; label: string }> = []
+  for (const rawModel of props.availableModels) {
+    const model = rawModel.trim()
+    if (!model || seen.has(model)) {
+      continue
+    }
+    seen.add(model)
+    options.push({ value: model, label: model })
+  }
+  return options
+})
+
 const availableOptions = computed(() => {
-  if (normalizedPlatforms.value.length === 0) {
-    return allModels
+  let baseOptions: Array<{ value: string; label: string }>
+
+  if (explicitOptions.value !== null) {
+    baseOptions = [...explicitOptions.value]
+  } else if (normalizedPlatforms.value.length === 0) {
+    baseOptions = allModels
+  } else {
+    const allowedModels = new Set<string>()
+    for (const platform of normalizedPlatforms.value) {
+      for (const model of getModelsByPlatform(platform)) {
+        allowedModels.add(model)
+      }
+    }
+
+    baseOptions = allModels.filter(model => allowedModels.has(model.value))
+  }
+
+  const seen = new Set(baseOptions.map(option => option.value))
+  const mergedOptions = [...baseOptions]
+  for (const model of props.modelValue) {
+    const normalized = model.trim()
+    if (!normalized || seen.has(normalized)) {
+      continue
+    }
+    seen.add(normalized)
+    mergedOptions.push({ value: normalized, label: normalized })
+  }
+
+  return mergedOptions
+})
+
+const filteredModels = computed(() => {
+  const query = searchQuery.value.toLowerCase().trim()
+  if (!query) return availableOptions.value
+  return availableOptions.value.filter(
+    m => m.value.toLowerCase().includes(query) || m.label.toLowerCase().includes(query)
+  )
+})
+
+const fillRelatedModelValues = computed(() => {
+  if (explicitOptions.value !== null) {
+    return explicitOptions.value.map(option => option.value)
   }
 
   const allowedModels = new Set<string>()
@@ -174,15 +233,7 @@ const availableOptions = computed(() => {
     }
   }
 
-  return allModels.filter(model => allowedModels.has(model.value))
-})
-
-const filteredModels = computed(() => {
-  const query = searchQuery.value.toLowerCase().trim()
-  if (!query) return availableOptions.value
-  return availableOptions.value.filter(
-    m => m.value.toLowerCase().includes(query) || m.label.toLowerCase().includes(query)
-  )
+  return [...allowedModels]
 })
 
 const toggleDropdown = () => {
@@ -219,11 +270,9 @@ const handleEnter = () => {
 
 const fillRelated = () => {
   const newModels = [...props.modelValue]
-  for (const platform of normalizedPlatforms.value) {
-    for (const model of getModelsByPlatform(platform)) {
-      if (!newModels.includes(model)) {
-        newModels.push(model)
-      }
+  for (const model of fillRelatedModelValues.value) {
+    if (!newModels.includes(model)) {
+      newModels.push(model)
     }
   }
   emit('update:modelValue', newModels)

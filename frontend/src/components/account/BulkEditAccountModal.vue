@@ -228,6 +228,7 @@
               <ModelWhitelistSelector
                 v-model="allowedModels"
                 :platforms="selectedPlatforms"
+                :available-models="availableModelOptions"
               />
 
               <p class="text-xs text-gray-500 dark:text-gray-400">
@@ -908,7 +909,13 @@ import { ref, watch, computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useAppStore } from '@/stores/app'
 import { adminAPI } from '@/api/admin'
-import type { Proxy as ProxyConfig, AdminGroup, AccountPlatform, AccountType } from '@/types'
+import type {
+  Proxy as ProxyConfig,
+  AdminGroup,
+  AccountPlatform,
+  AccountType,
+  ClaudeModel
+} from '@/types'
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 import Select from '@/components/common/Select.vue'
@@ -1021,6 +1028,7 @@ const pendingUpdatesForConfirm = ref<Record<string, unknown> | null>(null)
 const baseUrl = ref('')
 const modelRestrictionMode = ref<'whitelist' | 'mapping'>('whitelist')
 const allowedModels = ref<string[]>([])
+const availableModelOptions = ref<string[]>([])
 const modelMappings = ref<ModelMapping[]>([])
 const selectedErrorCodes = ref<number[]>([])
 const customErrorCodeInput = ref<number | null>(null)
@@ -1039,6 +1047,7 @@ const bulkBaseRpm = ref<number | null>(null)
 const bulkRpmStrategy = ref<'tiered' | 'sticky_exempt'>('tiered')
 const bulkRpmStickyBuffer = ref<number | null>(null)
 const userMsgQueueMode = ref<string | null>(null)
+let availableModelOptionsRequestSeq = 0
 const umqModeOptions = computed(() => [
   { value: '', label: t('admin.accounts.quotaControl.rpmLimit.umqModeOff') },
   { value: 'throttle', label: t('admin.accounts.quotaControl.rpmLimit.umqModeThrottle') },
@@ -1074,6 +1083,57 @@ const openAIWSModeOptions = computed(() => [
 const openAIWSModeConcurrencyHintKey = computed(() =>
   resolveOpenAIWSModeConcurrencyHintKey(openaiOAuthResponsesWebSocketV2Mode.value)
 )
+
+const extractModelOptionIDs = (models: ClaudeModel[]) => {
+  const seen = new Set<string>()
+  const ids: string[] = []
+  for (const model of models) {
+    const id = model.id?.trim()
+    if (!id || seen.has(id)) {
+      continue
+    }
+    seen.add(id)
+    ids.push(id)
+  }
+  return ids
+}
+
+const resetAvailableModelOptions = () => {
+  availableModelOptionsRequestSeq += 1
+  availableModelOptions.value = []
+}
+
+const loadAvailableModelOptions = async (platforms: AccountPlatform[]) => {
+  if (!props.show) {
+    return
+  }
+
+  const requestSeq = ++availableModelOptionsRequestSeq
+  const uniquePlatforms = Array.from(new Set(platforms))
+
+  if (uniquePlatforms.length === 0) {
+    availableModelOptions.value = []
+    return
+  }
+
+  try {
+    const responses = await Promise.all(
+      uniquePlatforms.map(platform => adminAPI.accounts.getModelOptions(platform))
+    )
+    if (!props.show || requestSeq !== availableModelOptionsRequestSeq) {
+      return
+    }
+
+    availableModelOptions.value = extractModelOptionIDs(responses.flat())
+  } catch (error: any) {
+    if (!props.show || requestSeq !== availableModelOptionsRequestSeq) {
+      return
+    }
+
+    availableModelOptions.value = []
+    appStore.showError(error.response?.data?.message || error.response?.data?.detail || t('admin.accounts.failedToLoad'))
+  }
+}
 
 // Model mapping helpers
 const addModelMapping = () => {
@@ -1418,6 +1478,19 @@ const handleMixedChannelCancel = () => {
 
 // Reset form when modal closes
 watch(
+  () => [props.show, ...props.selectedPlatforms],
+  ([show]) => {
+    if (!show) {
+      resetAvailableModelOptions()
+      return
+    }
+
+    loadAvailableModelOptions(props.selectedPlatforms)
+  },
+  { immediate: true }
+)
+
+watch(
   () => props.show,
   (newShow) => {
     if (!newShow) {
@@ -1442,6 +1515,7 @@ watch(
       openaiPassthroughEnabled.value = false
       modelRestrictionMode.value = 'whitelist'
       allowedModels.value = []
+      resetAvailableModelOptions()
       modelMappings.value = []
       selectedErrorCodes.value = []
       customErrorCodeInput.value = null

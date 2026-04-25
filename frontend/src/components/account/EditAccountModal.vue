@@ -135,7 +135,11 @@
 
             <!-- Whitelist Mode -->
             <div v-if="modelRestrictionMode === 'whitelist'">
-              <ModelWhitelistSelector v-model="allowedModels" :platform="account?.platform || 'anthropic'" />
+              <ModelWhitelistSelector
+                v-model="allowedModels"
+                :platform="account?.platform || 'anthropic'"
+                :available-models="availableModelOptions"
+              />
               <p class="text-xs text-gray-500 dark:text-gray-400">
                 {{ t('admin.accounts.selectedModels', { count: allowedModels.length }) }}
                 <span v-if="allowedModels.length === 0">{{
@@ -450,7 +454,11 @@
 
           <!-- Whitelist Mode -->
           <div v-if="modelRestrictionMode === 'whitelist'">
-            <ModelWhitelistSelector v-model="allowedModels" :platform="account?.platform || 'anthropic'" />
+            <ModelWhitelistSelector
+              v-model="allowedModels"
+              :platform="account?.platform || 'anthropic'"
+              :available-models="availableModelOptions"
+            />
             <p class="text-xs text-gray-500 dark:text-gray-400">
               {{ t('admin.accounts.selectedModels', { count: allowedModels.length }) }}
               <span v-if="allowedModels.length === 0">{{
@@ -669,7 +677,11 @@
 
           <!-- Whitelist Mode -->
           <div v-if="modelRestrictionMode === 'whitelist'">
-            <ModelWhitelistSelector v-model="allowedModels" platform="anthropic" />
+            <ModelWhitelistSelector
+              v-model="allowedModels"
+              platform="anthropic"
+              :available-models="availableModelOptions"
+            />
             <p class="text-xs text-gray-500 dark:text-gray-400">
               {{ t('admin.accounts.selectedModels', { count: allowedModels.length }) }}
               <span v-if="allowedModels.length === 0">{{ t('admin.accounts.supportsAllModels') }}</span>
@@ -1903,7 +1915,14 @@ import { useAppStore } from '@/stores/app'
 import { useAuthStore } from '@/stores/auth'
 import { adminAPI } from '@/api/admin'
 import { useQuotaNotifyState } from '@/composables/useQuotaNotifyState'
-import type { Account, Proxy, AdminGroup, CheckMixedChannelResponse, OpenAICompactMode } from '@/types'
+import type {
+  Account,
+  Proxy,
+  AdminGroup,
+  CheckMixedChannelResponse,
+  ClaudeModel,
+  OpenAICompactMode
+} from '@/types'
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 import Select from '@/components/common/Select.vue'
@@ -1991,6 +2010,7 @@ const modelMappings = ref<ModelMapping[]>([])
 const openAICompactModelMappings = ref<ModelMapping[]>([])
 const modelRestrictionMode = ref<'whitelist' | 'mapping'>('whitelist')
 const allowedModels = ref<string[]>([])
+const availableModelOptions = ref<string[]>([])
 const DEFAULT_POOL_MODE_RETRY_COUNT = 3
 const MAX_POOL_MODE_RETRY_COUNT = 10
 const poolModeEnabled = ref(false)
@@ -2011,6 +2031,7 @@ const getModelMappingKey = createStableObjectKeyResolver<ModelMapping>('edit-mod
 const getOpenAICompactModelMappingKey = createStableObjectKeyResolver<ModelMapping>('edit-openai-compact-model-mapping')
 const getAntigravityModelMappingKey = createStableObjectKeyResolver<ModelMapping>('edit-antigravity-model-mapping')
 const getTempUnschedRuleKey = createStableObjectKeyResolver<TempUnschedRuleForm>('edit-temp-unsched-rule')
+let availableModelOptionsRequestSeq = 0
 
 const showMixedChannelWarning = ref(false)
 const mixedChannelWarningDetails = ref<{ groupName: string; currentPlatform: string; otherPlatform: string } | null>(
@@ -2201,6 +2222,49 @@ const expiresAtInput = computed({
     form.expires_at = parseDateTimeLocal(value)
   }
 })
+
+const extractModelOptionIDs = (models: ClaudeModel[]) => {
+  const seen = new Set<string>()
+  const ids: string[] = []
+  for (const model of models) {
+    const id = model.id?.trim()
+    if (!id || seen.has(id)) {
+      continue
+    }
+    seen.add(id)
+    ids.push(id)
+  }
+  return ids
+}
+
+const resetAvailableModelOptions = () => {
+  availableModelOptionsRequestSeq += 1
+  availableModelOptions.value = []
+}
+
+const loadAvailableModelOptions = async (platform: Account['platform']) => {
+  if (!props.show) {
+    return
+  }
+
+  const requestSeq = ++availableModelOptionsRequestSeq
+
+  try {
+    const models = await adminAPI.accounts.getModelOptions(platform)
+    if (!props.show || requestSeq !== availableModelOptionsRequestSeq || props.account?.platform !== platform) {
+      return
+    }
+
+    availableModelOptions.value = extractModelOptionIDs(models)
+  } catch (error: any) {
+    if (!props.show || requestSeq !== availableModelOptionsRequestSeq || props.account?.platform !== platform) {
+      return
+    }
+
+    availableModelOptions.value = []
+    appStore.showError(error.response?.data?.message || error.response?.data?.detail || t('admin.accounts.failedToLoad'))
+  }
+}
 
 // Watchers
 const normalizePoolModeRetryCount = (value: number) => {
@@ -2520,11 +2584,13 @@ watch(
   [() => props.show, () => props.account],
   ([show, newAccount], [wasShow, previousAccount]) => {
     if (!show || !newAccount) {
+      resetAvailableModelOptions()
       return
     }
     if (!wasShow || newAccount !== previousAccount) {
       syncFormFromAccount(newAccount)
       loadTLSProfiles()
+      loadAvailableModelOptions(newAccount.platform)
     }
   },
   { immediate: true }

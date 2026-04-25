@@ -16,7 +16,8 @@ vi.mock('@/api/admin', () => ({
   adminAPI: {
     accounts: {
       bulkUpdate: vi.fn(),
-      checkMixedChannelRisk: vi.fn()
+      checkMixedChannelRisk: vi.fn(),
+      getModelOptions: vi.fn()
     }
   }
 }))
@@ -83,6 +84,25 @@ describe('BulkEditAccountModal', () => {
       failed: 0,
       results: []
     } as any)
+    vi.mocked(adminAPI.accounts.getModelOptions).mockImplementation(async (platform: any) => {
+      switch (platform) {
+        case 'antigravity':
+          return [
+            { id: 'gemini-3.1-flash-image' },
+            { id: 'gemini-2.5-flash-image' }
+          ] as any
+        case 'anthropic':
+          return [
+            { id: 'claude-sonnet-4-20250514' }
+          ] as any
+        case 'openai':
+          return [
+            { id: 'gpt-5.5' }
+          ] as any
+        default:
+          return [] as any
+      }
+    })
     vi.mocked(adminAPI.accounts.checkMixedChannelRisk).mockResolvedValue({
       has_risk: false
     } as any)
@@ -90,6 +110,7 @@ describe('BulkEditAccountModal', () => {
 
   it('antigravity 白名单包含 Gemini 图片模型且过滤掉普通 GPT 模型', async () => {
     const wrapper = mountModal()
+    await flushPromises()
     const selector = wrapper.findComponent(ModelWhitelistSelector)
     expect(selector.exists()).toBe(true)
 
@@ -97,6 +118,21 @@ describe('BulkEditAccountModal', () => {
 
     expect(wrapper.text()).toContain('gemini-3.1-flash-image')
     expect(wrapper.text()).toContain('gemini-2.5-flash-image')
+    expect(wrapper.text()).not.toContain('gpt-5.3-codex')
+  })
+
+  it('混合平台白名单使用后端返回模型并集，而不是前端硬编码全集', async () => {
+    const wrapper = mountModal({
+      selectedPlatforms: ['anthropic', 'openai'],
+      selectedTypes: ['apikey']
+    })
+    await flushPromises()
+
+    const selector = wrapper.findComponent(ModelWhitelistSelector)
+    await selector.find('div.cursor-pointer').trigger('click')
+
+    expect(wrapper.text()).toContain('claude-sonnet-4-20250514')
+    expect(wrapper.text()).toContain('gpt-5.5')
     expect(wrapper.text()).not.toContain('gpt-5.3-codex')
   })
 
