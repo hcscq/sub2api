@@ -84,6 +84,7 @@ const (
 	codexSparkImageUnsupportedMarker = "<sub2api-codex-spark-image-unsupported>"
 	codexSparkImageUnsupportedText   = codexSparkImageUnsupportedMarker + "\nThe current model is gpt-5.3-codex-spark, which does not support image generation, image editing, image input, the `image_generation` tool, or Codex `image_gen`/`$imagegen` workflows. If the user asks for image generation or image editing, clearly explain this model limitation and ask them to switch to a non-Spark Codex model such as gpt-5.3-codex or gpt-5.4. Do not claim that the local environment merely lacks image_gen tooling, and do not suggest CLI fallback as the primary fix while the model remains Spark.\n</sub2api-codex-spark-image-unsupported>"
 )
+
 func applyCodexOAuthTransform(reqBody map[string]any, isCodexCLI bool, isCompact bool) codexTransformResult {
 	result := codexTransformResult{}
 	// 工具续链需求会影响存储策略与 input 过滤逻辑。
@@ -677,6 +678,82 @@ func validateOpenAIResponsesImageModel(reqBody map[string]any, model string) err
 		return nil
 	}
 	return fmt.Errorf("/v1/responses image_generation requests require a Responses-capable text model; image-only model %q is not allowed", model)
+}
+
+func normalizeOpenAIResponsesImageOnlyModel(reqBody map[string]any) bool {
+	if len(reqBody) == 0 {
+		return false
+	}
+	imageModel := strings.TrimSpace(firstNonEmptyString(reqBody["model"]))
+	if !isOpenAIImageGenerationModel(imageModel) {
+		return false
+	}
+
+	modified := false
+	tools, _ := reqBody["tools"].([]any)
+	imageToolIndex := -1
+	for i, rawTool := range tools {
+		toolMap, ok := rawTool.(map[string]any)
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(firstNonEmptyString(toolMap["type"])) == "image_generation" {
+			imageToolIndex = i
+			break
+		}
+	}
+	if imageToolIndex < 0 {
+		tools = append(tools, map[string]any{
+			"type":  "image_generation",
+			"model": imageModel,
+		})
+		imageToolIndex = len(tools) - 1
+		reqBody["tools"] = tools
+		modified = true
+	}
+
+	if toolMap, ok := tools[imageToolIndex].(map[string]any); ok {
+		if strings.TrimSpace(firstNonEmptyString(toolMap["model"])) == "" {
+			toolMap["model"] = imageModel
+			modified = true
+		}
+		for _, key := range []string{
+			"size",
+			"quality",
+			"background",
+			"output_format",
+			"output_compression",
+			"moderation",
+			"style",
+			"partial_images",
+		} {
+			if value, exists := reqBody[key]; exists && value != nil {
+				if _, toolHas := toolMap[key]; !toolHas {
+					toolMap[key] = value
+				}
+				delete(reqBody, key)
+				modified = true
+			}
+		}
+	}
+
+	if prompt := strings.TrimSpace(firstNonEmptyString(reqBody["prompt"])); prompt != "" {
+		if _, hasInput := reqBody["input"]; !hasInput {
+			reqBody["input"] = prompt
+		}
+		delete(reqBody, "prompt")
+		modified = true
+	}
+
+	if _, ok := reqBody["tool_choice"]; !ok {
+		reqBody["tool_choice"] = map[string]any{"type": "image_generation"}
+		modified = true
+	}
+	if imageModel != openAIImagesResponsesMainModel {
+		modified = true
+	}
+	reqBody["model"] = openAIImagesResponsesMainModel
+	return modified
 }
 
 func normalizeOpenAIModelForUpstream(account *Account, model string) string {

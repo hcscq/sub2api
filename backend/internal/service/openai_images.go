@@ -45,11 +45,12 @@ const (
 	openAIChatGPTConversationPrepareURL = "https://chatgpt.com/backend-api/f/conversation/prepare"
 	openAIChatGPTChatRequirementsURL    = "https://chatgpt.com/backend-api/sentinel/chat-requirements"
 
-	openAIImageBackendUserAgent  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-	openAIImageRequirementsDiff  = "0fffff"
-	openAIImageLifecycleTimeout  = 2 * time.Minute
-	openAIImageMaxDownloadBytes  = 20 << 20 // 20MB per image download
-	openAIImageMaxUploadPartSize = 20 << 20 // 20MB per multipart upload part
+	openAIImageBackendUserAgent    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+	openAIImageRequirementsDiff    = "0fffff"
+	openAIImageLifecycleTimeout    = 2 * time.Minute
+	openAIImageMaxDownloadBytes    = 20 << 20 // 20MB per image download
+	openAIImageMaxUploadPartSize   = 20 << 20 // 20MB per multipart upload part
+	openAIImagesResponsesMainModel = "gpt-5.4-mini"
 )
 
 type OpenAIImagesCapability string

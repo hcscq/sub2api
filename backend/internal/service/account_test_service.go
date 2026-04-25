@@ -683,7 +683,7 @@ func (s *AccountTestService) reconcileOpenAI429State(ctx context.Context, accoun
 	}
 
 	var resetAt *time.Time
-	if calculated := calculateOpenAI429ResetTime(headers); calculated != nil {
+	if calculated := (&RateLimitService{}).calculateOpenAI429ResetTime(headers); calculated != nil {
 		resetAt = calculated
 	} else if unixTs := parseOpenAIRateLimitResetTime(body); unixTs != nil {
 		t := time.Unix(*unixTs, 0)
@@ -709,6 +709,7 @@ func (s *AccountTestService) reconcileOpenAI429State(ctx context.Context, accoun
 		account.ErrorMessage = ""
 	}
 }
+
 // testGeminiAccountConnection tests a Gemini account's connection
 func (s *AccountTestService) testGeminiAccountConnection(c *gin.Context, account *Account, modelID string, prompt string) error {
 	ctx := c.Request.Context()

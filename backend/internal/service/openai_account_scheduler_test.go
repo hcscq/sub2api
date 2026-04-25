@@ -77,6 +77,7 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_DefaultDisabledUsesLega
 		accountRepo:        schedulerTestOpenAIAccountRepo{accounts: accounts},
 		cache:              cache,
 		cfg:                cfg,
+		rateLimitService:   newOpenAIAdvancedSchedulerRateLimitService("false"),
 		concurrencyService: NewConcurrencyService(schedulerTestConcurrencyCache{}),
 	}
 
@@ -136,6 +137,7 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_DefaultDisabled_Require
 		accountRepo:        schedulerTestOpenAIAccountRepo{accounts: accounts},
 		cache:              &schedulerTestGatewayCache{},
 		cfg:                cfg,
+		rateLimitService:   newOpenAIAdvancedSchedulerRateLimitService("false"),
 		concurrencyService: NewConcurrencyService(schedulerTestConcurrencyCache{}),
 	}
 
@@ -178,6 +180,7 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_DefaultDisabled_Require
 		accountRepo:        schedulerTestOpenAIAccountRepo{accounts: accounts},
 		cache:              &schedulerTestGatewayCache{},
 		cfg:                cfg,
+		rateLimitService:   newOpenAIAdvancedSchedulerRateLimitService("false"),
 		concurrencyService: NewConcurrencyService(schedulerTestConcurrencyCache{}),
 	}
 
@@ -264,7 +267,7 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_EnabledUsesAdvancedPrev
 func TestOpenAIGatewayService_OpenAIAccountSchedulerMetrics_DisabledNoOp(t *testing.T) {
 	resetOpenAIAdvancedSchedulerSettingCacheForTest()
 
-	svc := &OpenAIGatewayService{}
+	svc := &OpenAIGatewayService{rateLimitService: newOpenAIAdvancedSchedulerRateLimitService("false")}
 	ttft := 120
 	svc.ReportOpenAIAccountScheduleResult(10, true, &ttft)
 	svc.RecordOpenAIAccountSwitch()
