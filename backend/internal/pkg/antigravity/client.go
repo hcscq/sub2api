@@ -440,7 +440,7 @@ func (c *Client) GetUserInfo(ctx context.Context, accessToken string) (*UserInfo
 func (c *Client) LoadCodeAssist(ctx context.Context, accessToken string) (*LoadCodeAssistResponse, map[string]any, error) {
 	reqBody := LoadCodeAssistRequest{}
 	reqBody.Metadata.IDEType = "ANTIGRAVITY"
-	reqBody.Metadata.IDEVersion = "1.20.6"
+	reqBody.Metadata.IDEVersion = GetIDEVersion()
 	reqBody.Metadata.IDEName = "antigravity"
 
 	bodyBytes, err := json.Marshal(reqBody)
