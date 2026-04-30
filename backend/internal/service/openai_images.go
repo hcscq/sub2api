@@ -524,6 +524,7 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 			imageCount = nonStreamCount
 		}
 	}
+	usage = normalizeOpenAIImagesUsage(usage)
 	return &OpenAIForwardResult{
 		RequestID:       resp.Header.Get("x-request-id"),
 		Usage:           usage,
@@ -772,6 +773,16 @@ func mergeOpenAIUsage(dst *OpenAIUsage, body []byte) {
 	}
 }
 
+func normalizeOpenAIImagesUsage(usage OpenAIUsage) OpenAIUsage {
+	if usage.OutputTokens == 0 && usage.ImageOutputTokens > 0 {
+		usage.OutputTokens = usage.ImageOutputTokens
+	}
+	if usage.ImageOutputTokens == 0 && usage.OutputTokens > 0 {
+		usage.ImageOutputTokens = usage.OutputTokens
+	}
+	return usage
+}
+
 func extractOpenAIImageCountFromJSONBytes(body []byte) int {
 	if len(body) == 0 || !gjson.ValidBytes(body) {
 		return 0
@@ -914,7 +925,8 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesOAuth(
 		return nil, fmt.Errorf("openai image conversation returned no downloadable images")
 	}
 
-	responseBody, imageCount, err := buildOpenAIImageResponse(lifecycleCtx, client, headers, conversationID, pointerInfos)
+	usage = normalizeOpenAIImagesUsage(usage)
+	responseBody, imageCount, err := buildOpenAIImageResponse(lifecycleCtx, client, headers, conversationID, pointerInfos, usage)
 	if err != nil {
 		return nil, s.wrapOpenAIImageBackendError(ctx, c, account, err)
 	}
@@ -1707,6 +1719,7 @@ func buildOpenAIImageResponse(
 	headers http.Header,
 	conversationID string,
 	pointers []openAIImagePointerInfo,
+	usage OpenAIUsage,
 ) ([]byte, int, error) {
 	type responseItem struct {
 		B64JSON       string `json:"b64_json"`
@@ -1727,11 +1740,42 @@ func buildOpenAIImageResponse(
 		"created": time.Now().Unix(),
 		"data":    items,
 	}
+	if usagePayload := buildOpenAIImagesUsagePayload(usage); usagePayload != nil {
+		payload["usage"] = usagePayload
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, 0, err
 	}
 	return body, len(items), nil
+}
+
+func buildOpenAIImagesUsagePayload(usage OpenAIUsage) map[string]any {
+	usage = normalizeOpenAIImagesUsage(usage)
+	if usage.InputTokens == 0 &&
+		usage.OutputTokens == 0 &&
+		usage.CacheCreationInputTokens == 0 &&
+		usage.CacheReadInputTokens == 0 &&
+		usage.ImageOutputTokens == 0 {
+		return nil
+	}
+
+	payload := map[string]any{
+		"input_tokens":  usage.InputTokens,
+		"output_tokens": usage.OutputTokens,
+		"total_tokens":  usage.InputTokens + usage.OutputTokens,
+	}
+	if usage.CacheReadInputTokens > 0 {
+		payload["input_tokens_details"] = map[string]any{
+			"cached_tokens": usage.CacheReadInputTokens,
+		}
+	}
+	if usage.ImageOutputTokens > 0 {
+		payload["output_tokens_details"] = map[string]any{
+			"image_tokens": usage.ImageOutputTokens,
+		}
+	}
+	return payload
 }
 
 func resolveOpenAIImageBytes(

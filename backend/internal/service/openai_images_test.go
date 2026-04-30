@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -119,6 +120,33 @@ func TestOpenAIGatewayServiceParseOpenAIImagesRequest_RejectsNonImageModel(t *te
 	parsed, err := svc.ParseOpenAIImagesRequest(c, body)
 	require.Nil(t, parsed)
 	require.ErrorContains(t, err, `images endpoint requires an image model, got "gpt-5.4"`)
+}
+
+func TestBuildOpenAIImageResponseIncludesUsage(t *testing.T) {
+	body, imageCount, err := buildOpenAIImageResponse(
+		context.Background(),
+		nil,
+		nil,
+		"",
+		[]openAIImagePointerInfo{{B64JSON: "QUJD"}},
+		OpenAIUsage{InputTokens: 12, OutputTokens: 34},
+	)
+	require.NoError(t, err)
+	require.Equal(t, 1, imageCount)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(body, &payload))
+	require.Len(t, payload["data"], 1)
+
+	usage, ok := payload["usage"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, float64(12), usage["input_tokens"])
+	require.Equal(t, float64(34), usage["output_tokens"])
+	require.Equal(t, float64(46), usage["total_tokens"])
+
+	outputDetails, ok := usage["output_tokens_details"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, float64(34), outputDetails["image_tokens"])
 }
 
 func TestCollectOpenAIImagePointers_RecognizesDirectAssets(t *testing.T) {
