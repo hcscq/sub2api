@@ -86,6 +86,31 @@ func TestResolveOpenAIForwardModel(t *testing.T) {
 			expectedModel:      "gpt-5.5",
 		},
 		{
+			name: "preserves explicit gpt-5.5 pro alias instead of group default",
+			account: &Account{
+				Type:        AccountTypeOAuth,
+				Credentials: map[string]any{},
+			},
+			requestedModel:     "gpt-5.5-pro",
+			defaultMappedModel: "gpt-5.4",
+			expectedModel:      "gpt-5.5-pro",
+		},
+		{
+			name: "maps explicit gpt-5.5 pro alias through oauth account mapping",
+			account: &Account{
+				Platform: PlatformOpenAI,
+				Type:     AccountTypeOAuth,
+				Credentials: map[string]any{
+					"model_mapping": map[string]any{
+						"gpt-5.5": "gpt-5.5",
+					},
+				},
+			},
+			requestedModel:     "gpt-5.5-pro",
+			defaultMappedModel: "gpt-5.4",
+			expectedModel:      "gpt-5.5",
+		},
+		{
 			name: "preserves openai namespaced gpt-5.5 instead of group default",
 			account: &Account{
 				Credentials: map[string]any{},
@@ -238,6 +263,18 @@ func TestNormalizeOpenAIModelForUpstream(t *testing.T) {
 			account: &Account{Type: AccountTypeAPIKey},
 			model:   "gpt-4.1",
 			want:    "gpt-4.1",
+		},
+		{
+			name:    "oauth normalizes gpt-5.5 pro alias",
+			account: &Account{Type: AccountTypeOAuth},
+			model:   "gpt-5.5-pro",
+			want:    "gpt-5.5",
+		},
+		{
+			name:    "apikey preserves gpt-5.5 pro alias",
+			account: &Account{Type: AccountTypeAPIKey},
+			model:   "gpt-5.5-pro",
+			want:    "gpt-5.5-pro",
 		},
 	}
 

@@ -580,6 +580,30 @@ func normalizeRequestedModelForLookup(platform, requestedModel string) string {
 	return trimmed
 }
 
+func normalizeOpenAIOAuthRequestedModelForLookup(requestedModel string) string {
+	trimmed := strings.TrimSpace(requestedModel)
+	if trimmed == "" {
+		return ""
+	}
+
+	modelID := trimmed
+	if strings.Contains(modelID, "/") {
+		parts := strings.Split(modelID, "/")
+		modelID = strings.TrimSpace(parts[len(parts)-1])
+	}
+	if modelID == "" {
+		return trimmed
+	}
+
+	if mapped := getNormalizedCodexModel(modelID); mapped != "" {
+		return mapped
+	}
+	if compat := NormalizeOpenAICompatRequestedModel(modelID); compat != "" && compat != modelID {
+		return compat
+	}
+	return trimmed
+}
+
 func mappingSupportsRequestedModel(mapping map[string]string, requestedModel string) bool {
 	if requestedModel == "" {
 		return false
@@ -616,7 +640,14 @@ func (a *Account) IsModelSupported(requestedModel string) bool {
 		return true
 	}
 	normalized := normalizeRequestedModelForLookup(a.Platform, requestedModel)
-	return normalized != requestedModel && mappingSupportsRequestedModel(mapping, normalized)
+	if normalized != requestedModel && mappingSupportsRequestedModel(mapping, normalized) {
+		return true
+	}
+	if a.Platform == PlatformOpenAI && a.Type == AccountTypeOAuth {
+		openAINormalized := normalizeOpenAIOAuthRequestedModelForLookup(requestedModel)
+		return openAINormalized != requestedModel && mappingSupportsRequestedModel(mapping, openAINormalized)
+	}
+	return false
 }
 
 // GetMappedModel 获取映射后的模型名（支持通配符，最长优先匹配）
@@ -640,6 +671,14 @@ func (a *Account) ResolveMappedModel(requestedModel string) (mappedModel string,
 	if normalized != requestedModel {
 		if mappedModel, matched := resolveRequestedModelInMapping(mapping, normalized); matched {
 			return mappedModel, true
+		}
+	}
+	if a.Platform == PlatformOpenAI && a.Type == AccountTypeOAuth {
+		openAINormalized := normalizeOpenAIOAuthRequestedModelForLookup(requestedModel)
+		if openAINormalized != requestedModel {
+			if mappedModel, matched := resolveRequestedModelInMapping(mapping, openAINormalized); matched {
+				return mappedModel, true
+			}
 		}
 	}
 	return requestedModel, false

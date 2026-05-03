@@ -324,6 +324,7 @@ func TestAccountResolveMappedModel(t *testing.T) {
 	tests := []struct {
 		name           string
 		platform       string
+		accountType    string
 		credentials    map[string]any
 		requestedModel string
 		expectedModel  string
@@ -357,6 +358,45 @@ func TestAccountResolveMappedModel(t *testing.T) {
 			requestedModel: "gpt-5.4",
 			expectedModel:  "gpt-5.4",
 			expectedMatch:  true,
+		},
+		{
+			name:        "openai oauth pro alias resolves through codex base mapping",
+			platform:    PlatformOpenAI,
+			accountType: AccountTypeOAuth,
+			credentials: map[string]any{
+				"model_mapping": map[string]any{
+					"gpt-5.5": "gpt-5.5",
+				},
+			},
+			requestedModel: "gpt-5.5-pro",
+			expectedModel:  "gpt-5.5",
+			expectedMatch:  true,
+		},
+		{
+			name:        "openai oauth namespaced pro alias resolves through codex base mapping",
+			platform:    PlatformOpenAI,
+			accountType: AccountTypeOAuth,
+			credentials: map[string]any{
+				"model_mapping": map[string]any{
+					"gpt-5.4": "gpt-5.4",
+				},
+			},
+			requestedModel: "openai/gpt-5.4-pro",
+			expectedModel:  "gpt-5.4",
+			expectedMatch:  true,
+		},
+		{
+			name:        "openai apikey does not collapse pro alias for model support",
+			platform:    PlatformOpenAI,
+			accountType: AccountTypeAPIKey,
+			credentials: map[string]any{
+				"model_mapping": map[string]any{
+					"gpt-5.5": "gpt-5.5",
+				},
+			},
+			requestedModel: "gpt-5.5-pro",
+			expectedModel:  "gpt-5.5-pro",
+			expectedMatch:  false,
 		},
 		{
 			name:     "gemini customtools alias reports normalized match",
@@ -400,6 +440,7 @@ func TestAccountResolveMappedModel(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			account := &Account{
 				Platform:    tt.platform,
+				Type:        tt.accountType,
 				Credentials: tt.credentials,
 			}
 			mappedModel, matched := account.ResolveMappedModel(tt.requestedModel)
