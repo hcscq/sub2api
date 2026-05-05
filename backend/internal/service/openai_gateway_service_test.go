@@ -113,6 +113,14 @@ func (w *failingGinWriter) Write(p []byte) (int, error) {
 	return w.ResponseWriter.Write(p)
 }
 
+func (w *failingGinWriter) WriteString(s string) (int, error) {
+	if w.writes >= w.failAfter {
+		return 0, errors.New("write failed")
+	}
+	w.writes++
+	return w.ResponseWriter.WriteString(s)
+}
+
 func (c stubConcurrencyCache) AcquireAccountSlot(ctx context.Context, accountID int64, maxConcurrency int, requestID string) (bool, error) {
 	if c.acquireResults != nil {
 		if result, ok := c.acquireResults[accountID]; ok {
@@ -1228,6 +1236,101 @@ func TestOpenAIStreamingClientDisconnectDrainsUpstreamUsage(t *testing.T) {
 	if strings.Contains(rec.Body.String(), "event: error") || strings.Contains(rec.Body.String(), "write_failed") {
 		t.Fatalf("expected no injected SSE error event, got %q", rec.Body.String())
 	}
+}
+
+func TestDetachStreamUpstreamContextPreservesStreamingAfterClientCancel(t *testing.T) {
+	type ctxKey string
+
+	parent, cancel := context.WithCancel(context.WithValue(context.Background(), ctxKey("request_id"), "rid-stream"))
+	streamCtx, releaseStreamCtx := detachStreamUpstreamContext(parent, true)
+	defer releaseStreamCtx()
+
+	cancel()
+
+	require.NoError(t, streamCtx.Err())
+	require.Nil(t, streamCtx.Done())
+	require.Equal(t, "rid-stream", streamCtx.Value(ctxKey("request_id")))
+
+	nonStreamParent, nonStreamCancel := context.WithCancel(context.Background())
+	nonStreamCtx, releaseNonStreamCtx := detachStreamUpstreamContext(nonStreamParent, false)
+	defer releaseNonStreamCtx()
+	nonStreamCancel()
+
+	require.ErrorIs(t, nonStreamCtx.Err(), context.Canceled)
+}
+
+func TestOpenAIChatCompletionsStreamingClientDisconnectDrainsUsage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{
+		Gateway: config.GatewayConfig{
+			StreamDataIntervalTimeout: 0,
+			StreamKeepaliveInterval:   0,
+			MaxLineSize:               defaultMaxLineSize,
+		},
+	}
+	svc := &OpenAIGatewayService{cfg: cfg}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	c.Writer = &failingGinWriter{ResponseWriter: c.Writer, failAfter: 0}
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body: io.NopCloser(strings.NewReader(strings.Join([]string{
+			`data: {"type":"response.created","response":{"id":"resp_cc_disconnect","model":"gpt-5"}}`,
+			``,
+			`data: {"type":"response.output_text.delta","delta":"already delivered"}`,
+			``,
+			`data: {"type":"response.completed","response":{"usage":{"input_tokens":13,"output_tokens":8,"input_tokens_details":{"cached_tokens":5}}}}`,
+			``,
+		}, "\n"))),
+		Header: http.Header{"x-request-id": []string{"rid_cc_disconnect"}},
+	}
+
+	result, err := svc.handleChatStreamingResponse(resp, c, "gpt-5", "gpt-5", "gpt-5", false, time.Now())
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, 13, result.Usage.InputTokens)
+	require.Equal(t, 8, result.Usage.OutputTokens)
+	require.Equal(t, 5, result.Usage.CacheReadInputTokens)
+}
+
+func TestOpenAIMessagesStreamingClientDisconnectDrainsUsage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{
+		Gateway: config.GatewayConfig{
+			StreamDataIntervalTimeout: 0,
+			StreamKeepaliveInterval:   0,
+			MaxLineSize:               defaultMaxLineSize,
+		},
+	}
+	svc := &OpenAIGatewayService{cfg: cfg}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	c.Writer = &failingGinWriter{ResponseWriter: c.Writer, failAfter: 0}
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body: io.NopCloser(strings.NewReader(strings.Join([]string{
+			`data: {"type":"response.created","response":{"id":"resp_messages_disconnect","model":"gpt-5"}}`,
+			``,
+			`data: {"type":"response.output_text.delta","delta":"already delivered"}`,
+			``,
+			`data: {"type":"response.completed","response":{"usage":{"input_tokens":21,"output_tokens":14,"input_tokens_details":{"cached_tokens":6}}}}`,
+			``,
+		}, "\n"))),
+		Header: http.Header{"x-request-id": []string{"rid_messages_disconnect"}},
+	}
+
+	result, err := svc.handleAnthropicStreamingResponse(resp, c, "gpt-5", "gpt-5", "gpt-5", time.Now())
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, 21, result.Usage.InputTokens)
+	require.Equal(t, 14, result.Usage.OutputTokens)
+	require.Equal(t, 6, result.Usage.CacheReadInputTokens)
 }
 
 func TestOpenAIStreamingMissingTerminalEventReturnsIncompleteError(t *testing.T) {

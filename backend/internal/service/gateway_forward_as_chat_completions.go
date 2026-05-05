@@ -357,6 +357,7 @@ func (s *GatewayService) handleCCStreamingFromAnthropic(
 	var usage ClaudeUsage
 	var firstTokenMs *int
 	firstChunk := true
+	clientDisconnected := false
 
 	scanner := bufio.NewScanner(resp.Body)
 	maxLineSize := defaultMaxLineSize
@@ -378,18 +379,23 @@ func (s *GatewayService) handleCCStreamingFromAnthropic(
 		}
 	}
 
-	writeChunk := func(chunk apicompat.ChatCompletionsChunk) bool {
+	writeChunk := func(chunk apicompat.ChatCompletionsChunk) {
+		if clientDisconnected {
+			return
+		}
 		sse, err := apicompat.ChatChunkToSSE(chunk)
 		if err != nil {
-			return false
+			return
 		}
 		if _, err := fmt.Fprint(c.Writer, sse); err != nil {
-			return true // client disconnected
+			clientDisconnected = true
+			logger.L().Info("forward_as_cc stream: client disconnected",
+				zap.String("request_id", requestID),
+			)
 		}
-		return false
 	}
 
-	processAnthropicEvent := func(event *apicompat.AnthropicStreamEvent) bool {
+	processAnthropicEvent := func(event *apicompat.AnthropicStreamEvent) {
 		if firstChunk {
 			firstChunk = false
 			ms := int(time.Since(startTime).Milliseconds())
@@ -405,18 +411,24 @@ func (s *GatewayService) handleCCStreamingFromAnthropic(
 			mergeAnthropicUsage(&usage, event.Message.Usage)
 		}
 
+		if clientDisconnected {
+			return
+		}
+
 		// Chain: Anthropic event → Responses events → CC chunks
 		responsesEvents := apicompat.AnthropicEventToResponsesEvents(event, anthState)
 		for _, resEvt := range responsesEvents {
 			ccChunks := apicompat.ResponsesEventToChatChunks(&resEvt, ccState)
 			for _, chunk := range ccChunks {
-				if disconnected := writeChunk(chunk); disconnected {
-					return true
+				writeChunk(chunk)
+				if clientDisconnected {
+					return
 				}
 			}
 		}
-		c.Writer.Flush()
-		return false
+		if !clientDisconnected {
+			c.Writer.Flush()
+		}
 	}
 
 	for scanner.Scan() {
@@ -439,9 +451,7 @@ func (s *GatewayService) handleCCStreamingFromAnthropic(
 			continue
 		}
 
-		if processAnthropicEvent(&event) {
-			return resultWithUsage(), nil
-		}
+		processAnthropicEvent(&event)
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -453,22 +463,40 @@ func (s *GatewayService) handleCCStreamingFromAnthropic(
 		}
 	}
 
-	// Finalize both state machines
-	finalResEvents := apicompat.FinalizeAnthropicResponsesStream(anthState)
-	for _, resEvt := range finalResEvents {
-		ccChunks := apicompat.ResponsesEventToChatChunks(&resEvt, ccState)
-		for _, chunk := range ccChunks {
-			writeChunk(chunk) //nolint:errcheck
+	if !clientDisconnected {
+		// Finalize both state machines
+		finalResEvents := apicompat.FinalizeAnthropicResponsesStream(anthState)
+		for _, resEvt := range finalResEvents {
+			ccChunks := apicompat.ResponsesEventToChatChunks(&resEvt, ccState)
+			for _, chunk := range ccChunks {
+				writeChunk(chunk)
+				if clientDisconnected {
+					break
+				}
+			}
+			if clientDisconnected {
+				break
+			}
+		}
+		if !clientDisconnected {
+			finalCCChunks := apicompat.FinalizeResponsesChatStream(ccState)
+			for _, chunk := range finalCCChunks {
+				writeChunk(chunk)
+				if clientDisconnected {
+					break
+				}
+			}
 		}
 	}
-	finalCCChunks := apicompat.FinalizeResponsesChatStream(ccState)
-	for _, chunk := range finalCCChunks {
-		writeChunk(chunk) //nolint:errcheck
+	if !clientDisconnected {
+		// Write [DONE] marker
+		if _, err := fmt.Fprint(c.Writer, "data: [DONE]\n\n"); err != nil {
+			clientDisconnected = true
+		}
 	}
-
-	// Write [DONE] marker
-	fmt.Fprint(c.Writer, "data: [DONE]\n\n") //nolint:errcheck
-	c.Writer.Flush()
+	if !clientDisconnected {
+		c.Writer.Flush()
+	}
 
 	return resultWithUsage(), nil
 }

@@ -173,7 +173,9 @@ func (s *OpenAIGatewayService) ForwardAsChatCompletions(
 	}
 
 	// 6. Build upstream request
-	upstreamReq, err := s.buildUpstreamRequest(ctx, c, account, responsesBody, token, true, promptCacheKey, false)
+	upstreamCtx, releaseUpstreamCtx := detachStreamUpstreamContext(ctx, true)
+	upstreamReq, err := s.buildUpstreamRequest(upstreamCtx, c, account, responsesBody, token, true, promptCacheKey, false)
+	releaseUpstreamCtx()
 	if err != nil {
 		return nil, fmt.Errorf("build upstream request: %w", err)
 	}
@@ -408,6 +410,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 	var usage OpenAIUsage
 	var firstTokenMs *int
 	firstChunk := true
+	clientDisconnected := false
 
 	scanner := bufio.NewScanner(resp.Body)
 	maxLineSize := defaultMaxLineSize
@@ -429,7 +432,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 		}
 	}
 
-	processDataLine := func(payload string) bool {
+	processDataLine := func(payload string) {
 		if firstChunk {
 			firstChunk = false
 			ms := int(time.Since(startTime).Milliseconds())
@@ -442,7 +445,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 				zap.Error(err),
 				zap.String("request_id", requestID),
 			)
-			return false
+			return
 		}
 
 		// Extract usage from completion events
@@ -455,6 +458,10 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 			if event.Response.Usage.InputTokensDetails != nil {
 				usage.CacheReadInputTokens = event.Response.Usage.InputTokensDetails.CachedTokens
 			}
+		}
+
+		if clientDisconnected {
+			return
 		}
 
 		chunks := apicompat.ResponsesEventToChatChunks(&event, state)
@@ -471,28 +478,39 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 				logger.L().Info("openai chat_completions stream: client disconnected",
 					zap.String("request_id", requestID),
 				)
-				return true
+				clientDisconnected = true
+				return
 			}
 		}
-		if len(chunks) > 0 {
+		if len(chunks) > 0 && !clientDisconnected {
 			c.Writer.Flush()
 		}
-		return false
 	}
 
 	finalizeStream := func() (*OpenAIForwardResult, error) {
-		if finalChunks := apicompat.FinalizeResponsesChatStream(state); len(finalChunks) > 0 {
-			for _, chunk := range finalChunks {
-				sse, err := apicompat.ChatChunkToSSE(chunk)
-				if err != nil {
-					continue
+		if !clientDisconnected {
+			if finalChunks := apicompat.FinalizeResponsesChatStream(state); len(finalChunks) > 0 {
+				for _, chunk := range finalChunks {
+					sse, err := apicompat.ChatChunkToSSE(chunk)
+					if err != nil {
+						continue
+					}
+					if _, err := fmt.Fprint(c.Writer, sse); err != nil {
+						clientDisconnected = true
+						break
+					}
 				}
-				fmt.Fprint(c.Writer, sse) //nolint:errcheck
 			}
 		}
-		// Send [DONE] sentinel
-		fmt.Fprint(c.Writer, "data: [DONE]\n\n") //nolint:errcheck
-		c.Writer.Flush()
+		if !clientDisconnected {
+			// Send [DONE] sentinel
+			if _, err := fmt.Fprint(c.Writer, "data: [DONE]\n\n"); err != nil {
+				clientDisconnected = true
+			}
+		}
+		if !clientDisconnected {
+			c.Writer.Flush()
+		}
 		return resultWithUsage(), nil
 	}
 
@@ -518,9 +536,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 			if !strings.HasPrefix(line, "data: ") || line == "data: [DONE]" {
 				continue
 			}
-			if processDataLine(line[6:]) {
-				return resultWithUsage(), nil
-			}
+			processDataLine(line[6:])
 		}
 		handleScanErr(scanner.Err())
 		return finalizeStream()
@@ -573,11 +589,12 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 			if !strings.HasPrefix(line, "data: ") || line == "data: [DONE]" {
 				continue
 			}
-			if processDataLine(line[6:]) {
-				return resultWithUsage(), nil
-			}
+			processDataLine(line[6:])
 
 		case <-keepaliveTicker.C:
+			if clientDisconnected {
+				continue
+			}
 			if time.Since(lastDataAt) < keepaliveInterval {
 				continue
 			}
@@ -586,7 +603,8 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 				logger.L().Info("openai chat_completions stream: client disconnected during keepalive",
 					zap.String("request_id", requestID),
 				)
-				return resultWithUsage(), nil
+				clientDisconnected = true
+				continue
 			}
 			c.Writer.Flush()
 		}

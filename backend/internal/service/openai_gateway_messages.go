@@ -128,7 +128,9 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 	}
 
 	// 6. Build upstream request
-	upstreamReq, err := s.buildUpstreamRequest(ctx, c, account, responsesBody, token, isStream, promptCacheKey, false)
+	upstreamCtx, releaseUpstreamCtx := detachStreamUpstreamContext(ctx, isStream)
+	upstreamReq, err := s.buildUpstreamRequest(upstreamCtx, c, account, responsesBody, token, isStream, promptCacheKey, false)
+	releaseUpstreamCtx()
 	if err != nil {
 		return nil, fmt.Errorf("build upstream request: %w", err)
 	}
@@ -374,6 +376,7 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 	var usage OpenAIUsage
 	var firstTokenMs *int
 	firstChunk := true
+	clientDisconnected := false
 
 	scanner := bufio.NewScanner(resp.Body)
 	maxLineSize := defaultMaxLineSize
@@ -397,8 +400,7 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 	}
 
 	// processDataLine handles a single "data: ..." SSE line from upstream.
-	// Returns (clientDisconnected bool).
-	processDataLine := func(payload string) bool {
+	processDataLine := func(payload string) {
 		if firstChunk {
 			firstChunk = false
 			ms := int(time.Since(startTime).Milliseconds())
@@ -411,7 +413,7 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 				zap.Error(err),
 				zap.String("request_id", requestID),
 			)
-			return false
+			return
 		}
 
 		// Extract usage from completion events
@@ -424,6 +426,10 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 			if event.Response.Usage.InputTokensDetails != nil {
 				usage.CacheReadInputTokens = event.Response.Usage.InputTokensDetails.CachedTokens
 			}
+		}
+
+		if clientDisconnected {
+			return
 		}
 
 		// Convert to Anthropic events
@@ -441,25 +447,32 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 				logger.L().Info("openai messages stream: client disconnected",
 					zap.String("request_id", requestID),
 				)
-				return true
+				clientDisconnected = true
+				return
 			}
 		}
-		if len(events) > 0 {
+		if len(events) > 0 && !clientDisconnected {
 			c.Writer.Flush()
 		}
-		return false
 	}
 
 	// finalizeStream sends any remaining Anthropic events and returns the result.
 	finalizeStream := func() (*OpenAIForwardResult, error) {
-		if finalEvents := apicompat.FinalizeResponsesAnthropicStream(state); len(finalEvents) > 0 {
-			for _, evt := range finalEvents {
-				sse, err := apicompat.ResponsesAnthropicEventToSSE(evt)
-				if err != nil {
-					continue
+		if !clientDisconnected {
+			if finalEvents := apicompat.FinalizeResponsesAnthropicStream(state); len(finalEvents) > 0 {
+				for _, evt := range finalEvents {
+					sse, err := apicompat.ResponsesAnthropicEventToSSE(evt)
+					if err != nil {
+						continue
+					}
+					if _, err := fmt.Fprint(c.Writer, sse); err != nil {
+						clientDisconnected = true
+						break
+					}
 				}
-				fmt.Fprint(c.Writer, sse) //nolint:errcheck
 			}
+		}
+		if !clientDisconnected {
 			c.Writer.Flush()
 		}
 		return resultWithUsage(), nil
@@ -488,9 +501,7 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 			if !strings.HasPrefix(line, "data: ") || line == "data: [DONE]" {
 				continue
 			}
-			if processDataLine(line[6:]) {
-				return resultWithUsage(), nil
-			}
+			processDataLine(line[6:])
 		}
 		handleScanErr(scanner.Err())
 		return finalizeStream()
@@ -544,11 +555,12 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 			if !strings.HasPrefix(line, "data: ") || line == "data: [DONE]" {
 				continue
 			}
-			if processDataLine(line[6:]) {
-				return resultWithUsage(), nil
-			}
+			processDataLine(line[6:])
 
 		case <-keepaliveTicker.C:
+			if clientDisconnected {
+				continue
+			}
 			if time.Since(lastDataAt) < keepaliveInterval {
 				continue
 			}
@@ -558,7 +570,8 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 				logger.L().Info("openai messages stream: client disconnected during keepalive",
 					zap.String("request_id", requestID),
 				)
-				return resultWithUsage(), nil
+				clientDisconnected = true
+				continue
 			}
 			c.Writer.Flush()
 		}
