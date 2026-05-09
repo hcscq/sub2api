@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 func TestOpenAIGatewayServiceParseOpenAIImagesRequest_JSON(t *testing.T) {
@@ -120,6 +122,38 @@ func TestOpenAIGatewayServiceParseOpenAIImagesRequest_RejectsNonImageModel(t *te
 	parsed, err := svc.ParseOpenAIImagesRequest(c, body)
 	require.Nil(t, parsed)
 	require.ErrorContains(t, err, `images endpoint requires an image model, got "gpt-5.4"`)
+}
+
+func TestRewriteOpenAIImagesModel_StripsUnsupportedResponseFormat(t *testing.T) {
+	body := []byte(`{"model":"gpt-image-1","prompt":"draw a cat","response_format":"b64_json"}`)
+
+	rewritten, contentType, err := rewriteOpenAIImagesModel(body, "application/json", "gpt-image-2")
+	require.NoError(t, err)
+	require.Equal(t, "application/json", contentType)
+	require.Equal(t, "gpt-image-2", gjson.GetBytes(rewritten, "model").String())
+	require.False(t, gjson.GetBytes(rewritten, "response_format").Exists())
+}
+
+func TestRewriteOpenAIImagesMultipartModel_StripsUnsupportedResponseFormat(t *testing.T) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	require.NoError(t, writer.WriteField("model", "gpt-image-1"))
+	require.NoError(t, writer.WriteField("prompt", "draw a cat"))
+	require.NoError(t, writer.WriteField("response_format", "b64_json"))
+	require.NoError(t, writer.Close())
+
+	rewritten, contentType, err := rewriteOpenAIImagesModel(body.Bytes(), writer.FormDataContentType(), "gpt-image-2")
+	require.NoError(t, err)
+
+	_, params, err := mime.ParseMediaType(contentType)
+	require.NoError(t, err)
+	form, err := multipart.NewReader(bytes.NewReader(rewritten), params["boundary"]).ReadForm(1 << 20)
+	require.NoError(t, err)
+	defer func() { _ = form.RemoveAll() }()
+
+	require.Equal(t, []string{"gpt-image-2"}, form.Value["model"])
+	require.Equal(t, []string{"draw a cat"}, form.Value["prompt"])
+	require.NotContains(t, form.Value, "response_format")
 }
 
 func TestBuildOpenAIImageResponseIncludesUsage(t *testing.T) {
