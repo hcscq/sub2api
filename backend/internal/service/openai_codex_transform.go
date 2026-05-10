@@ -205,6 +205,14 @@ func applyCodexOAuthTransform(reqBody map[string]any, isCodexCLI bool, isCompact
 	if applyInstructions(reqBody, isCodexCLI) {
 		result.Modified = true
 	}
+	if isCodexCLI && !isCompact && !isCodexSparkModel(normalizedModel) {
+		if ensureOpenAIResponsesImageGenerationTool(reqBody) {
+			result.Modified = true
+		}
+		if applyCodexImageGenerationBridgeInstructions(reqBody) {
+			result.Modified = true
+		}
+	}
 	if isCodexSparkModel(normalizedModel) && applyCodexSparkImageUnsupportedInstructions(reqBody) {
 		result.Modified = true
 	}
