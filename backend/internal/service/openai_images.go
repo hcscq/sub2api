@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/proxyurl"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
@@ -47,7 +48,8 @@ const (
 
 	openAIImageBackendUserAgent    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 	openAIImageRequirementsDiff    = "0fffff"
-	openAIImageLifecycleTimeout    = 2 * time.Minute
+	openAIImagePollInterval        = 3 * time.Second
+	openAIImagePreviewWait         = 15 * time.Second
 	openAIImageMaxDownloadBytes    = 20 << 20 // 20MB per image download
 	openAIImageMaxUploadPartSize   = 20 << 20 // 20MB per multipart upload part
 	openAIImagesResponsesMainModel = "gpt-5.4-mini"
@@ -110,6 +112,22 @@ func (r *OpenAIImagesRequest) StickySessionSeed() string {
 		seed += "|body=" + r.bodyHash
 	}
 	return seed
+}
+
+func resolveOpenAIImagePollTimeout(cfg *config.Config) time.Duration {
+	seconds := config.DefaultGatewayOpenAIImagePollTimeoutSeconds
+	if cfg != nil && cfg.Gateway.OpenAIImagePollTimeoutSeconds > 0 {
+		seconds = cfg.Gateway.OpenAIImagePollTimeoutSeconds
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func resolveOpenAIImageLifecycleTimeout(cfg *config.Config) time.Duration {
+	seconds := config.DefaultGatewayOpenAIImageLifecycleTimeoutSeconds
+	if cfg != nil && cfg.Gateway.OpenAIImageLifecycleTimeoutSeconds > 0 {
+		seconds = cfg.Gateway.OpenAIImageLifecycleTimeoutSeconds
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func (s *OpenAIGatewayService) ParseOpenAIImagesRequest(c *gin.Context, body []byte) (*OpenAIImagesRequest, error) {
@@ -917,10 +935,10 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesOAuth(
 		countOpenAIFileServicePointerInfos(pointerInfos),
 		countOpenAIDirectImageAssets(pointerInfos),
 	)
-	lifecycleCtx, releaseLifecycleCtx := detachOpenAIImageLifecycleContext(ctx, openAIImageLifecycleTimeout)
+	lifecycleCtx, releaseLifecycleCtx := detachOpenAIImageLifecycleContext(ctx, resolveOpenAIImageLifecycleTimeout(s.cfg))
 	defer releaseLifecycleCtx()
 	if conversationID != "" && !hasOpenAIFileServicePointerInfos(pointerInfos) {
-		polledPointers, pollErr := pollOpenAIImageConversation(lifecycleCtx, client, headers, conversationID)
+		polledPointers, pollErr := pollOpenAIImageConversation(lifecycleCtx, client, headers, conversationID, resolveOpenAIImagePollTimeout(s.cfg))
 		if pollErr != nil {
 			return nil, s.wrapOpenAIImageBackendError(ctx, c, account, pollErr)
 		}
@@ -1745,24 +1763,26 @@ func extractOpenAIImageMessageText(message map[string]any) string {
 	return strings.TrimSpace(strings.Join(textParts, "\n"))
 }
 
-func pollOpenAIImageConversation(ctx context.Context, client *req.Client, headers http.Header, conversationID string) ([]openAIImagePointerInfo, error) {
+func pollOpenAIImageConversation(ctx context.Context, client *req.Client, headers http.Header, conversationID string, timeout time.Duration) ([]openAIImagePointerInfo, error) {
 	conversationID = strings.TrimSpace(conversationID)
 	if conversationID == "" {
 		return nil, nil
 	}
-	deadline := time.Now().Add(90 * time.Second)
-	interval := 3 * time.Second
-	previewWait := 15 * time.Second
+	if timeout <= 0 {
+		timeout = time.Duration(config.DefaultGatewayOpenAIImagePollTimeoutSeconds) * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	conversationURL := fmt.Sprintf("https://chatgpt.com/backend-api/conversation/%s", conversationID)
 	var (
 		lastErr     error
 		firstToolAt time.Time
 	)
-	for time.Now().Before(deadline) {
+	for time.Until(deadline) > 0 {
 		resp, err := client.R().
 			SetContext(ctx).
 			SetHeaders(headerToMap(headers)).
 			DisableAutoReadResponse().
-			Get(fmt.Sprintf("https://chatgpt.com/backend-api/conversation/%s", conversationID))
+			Get(conversationURL)
 		if err != nil {
 			lastErr = err
 		} else {
@@ -1781,7 +1801,7 @@ func pollOpenAIImageConversation(ctx context.Context, client *req.Client, header
 				if hasOpenAIFileServicePointerInfos(pointers) {
 					return preferOpenAIFileServicePointerInfos(pointers), nil
 				}
-				if len(pointers) > 0 && !firstToolAt.IsZero() && time.Since(firstToolAt) >= previewWait {
+				if len(pointers) > 0 && !firstToolAt.IsZero() && time.Since(firstToolAt) >= openAIImagePreviewWait {
 					return pointers, nil
 				}
 				if len(pointers) == 0 && state.HasImageGenError() {
@@ -1814,17 +1834,47 @@ func pollOpenAIImageConversation(ctx context.Context, client *req.Client, header
 		}
 
 	waitNextPoll:
-		timer := time.NewTimer(interval)
+		wait := openAIImagePollInterval
+		if remaining := time.Until(deadline); remaining < wait {
+			wait = remaining
+		}
+		if wait <= 0 {
+			break
+		}
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
 			if !timer.Stop() {
-				<-timer.C
+				select {
+				case <-timer.C:
+				default:
+				}
 			}
 			return nil, ctx.Err()
 		case <-timer.C:
 		}
 	}
-	return nil, lastErr
+	if lastErr != nil {
+		logger.LegacyPrintf(
+			"service.openai_gateway",
+			"[OpenAI] Image conversation poll timed out conversation_id=%s timeout=%s last_error=%s",
+			conversationID,
+			timeout,
+			truncateString(lastErr.Error(), 240),
+		)
+	} else {
+		logger.LegacyPrintf(
+			"service.openai_gateway",
+			"[OpenAI] Image conversation poll timed out conversation_id=%s timeout=%s",
+			conversationID,
+			timeout,
+		)
+	}
+	return nil, newOpenAIImageSyntheticStatusError(
+		http.StatusRequestTimeout,
+		fmt.Sprintf("openai image generation timed out after %s", timeout),
+		conversationURL,
+	)
 }
 
 func buildOpenAIImageResponse(

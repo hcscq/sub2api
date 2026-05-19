@@ -20,6 +20,10 @@ const (
 	// DefaultGatewayAntigravityModelCapacitySwitchLimit controls how many cross-account
 	// switches Antigravity MODEL_CAPACITY_EXHAUSTED can trigger before failover stops.
 	DefaultGatewayAntigravityModelCapacitySwitchLimit = 4
+	// DefaultGatewayOpenAIImagePollTimeoutSeconds is the default ChatGPT image task polling budget.
+	DefaultGatewayOpenAIImagePollTimeoutSeconds = 180
+	// DefaultGatewayOpenAIImageLifecycleTimeoutSeconds is the default total detached image lifecycle budget.
+	DefaultGatewayOpenAIImageLifecycleTimeoutSeconds = 240
 )
 
 // 使用量记录队列溢出策略
@@ -359,6 +363,10 @@ type GatewayConfig struct {
 	// OpenAIPassthroughAllowTimeoutHeaders: OpenAI 透传模式是否放行客户端超时头
 	// 关闭（默认）可避免 x-stainless-timeout 等头导致上游提前断流。
 	OpenAIPassthroughAllowTimeoutHeaders bool `mapstructure:"openai_passthrough_allow_timeout_headers"`
+	// OpenAIImagePollTimeoutSeconds: ChatGPT image task polling timeout for gpt-image-* OAuth flow.
+	OpenAIImagePollTimeoutSeconds int `mapstructure:"openai_image_poll_timeout_seconds"`
+	// OpenAIImageLifecycleTimeoutSeconds: Detached lifecycle budget covering image polling plus downloads.
+	OpenAIImageLifecycleTimeoutSeconds int `mapstructure:"openai_image_lifecycle_timeout_seconds"`
 	// OpenAIWS: OpenAI Responses WebSocket 配置（默认开启，可按需回滚到 HTTP）
 	OpenAIWS GatewayOpenAIWSConfig `mapstructure:"openai_ws"`
 
@@ -1377,6 +1385,8 @@ func setDefaults() {
 	viper.SetDefault("gateway.antigravity_fast_failover_recycle_delay_ms", 250)
 	viper.SetDefault("gateway.force_codex_cli", false)
 	viper.SetDefault("gateway.openai_passthrough_allow_timeout_headers", false)
+	viper.SetDefault("gateway.openai_image_poll_timeout_seconds", DefaultGatewayOpenAIImagePollTimeoutSeconds)
+	viper.SetDefault("gateway.openai_image_lifecycle_timeout_seconds", DefaultGatewayOpenAIImageLifecycleTimeoutSeconds)
 	// OpenAI Responses WebSocket（默认开启；可通过 force_http 紧急回滚）
 	viper.SetDefault("gateway.openai_ws.enabled", true)
 	viper.SetDefault("gateway.openai_ws.mode_router_v2_enabled", false)
@@ -1995,6 +2005,21 @@ func (c *Config) Validate() error {
 	if c.Gateway.StreamKeepaliveInterval != 0 &&
 		(c.Gateway.StreamKeepaliveInterval < 5 || c.Gateway.StreamKeepaliveInterval > 30) {
 		return fmt.Errorf("gateway.stream_keepalive_interval must be 0 or between 5-30 seconds")
+	}
+	if c.Gateway.OpenAIImagePollTimeoutSeconds <= 0 {
+		return fmt.Errorf("gateway.openai_image_poll_timeout_seconds must be positive")
+	}
+	if c.Gateway.OpenAIImagePollTimeoutSeconds > 600 {
+		return fmt.Errorf("gateway.openai_image_poll_timeout_seconds must be <= 600")
+	}
+	if c.Gateway.OpenAIImageLifecycleTimeoutSeconds <= 0 {
+		return fmt.Errorf("gateway.openai_image_lifecycle_timeout_seconds must be positive")
+	}
+	if c.Gateway.OpenAIImageLifecycleTimeoutSeconds > 900 {
+		return fmt.Errorf("gateway.openai_image_lifecycle_timeout_seconds must be <= 900")
+	}
+	if c.Gateway.OpenAIImageLifecycleTimeoutSeconds < c.Gateway.OpenAIImagePollTimeoutSeconds+30 {
+		return fmt.Errorf("gateway.openai_image_lifecycle_timeout_seconds must be >= gateway.openai_image_poll_timeout_seconds + 30")
 	}
 	// 兼容旧键 sticky_previous_response_ttl_seconds
 	if c.Gateway.OpenAIWS.StickyResponseIDTTLSeconds <= 0 && c.Gateway.OpenAIWS.StickyPreviousResponseTTLSeconds > 0 {

@@ -1390,7 +1390,7 @@ func (s *AccountTestService) testOpenAIImageOAuth(c *gin.Context, ctx context.Co
 	pointerInfos = mergeOpenAIImagePointerInfos(pointerInfos, nil)
 	if conversationID != "" && !hasOpenAIFileServicePointerInfos(pointerInfos) {
 		s.sendEvent(c, TestEvent{Type: "content", Text: "Waiting for image generation to complete...\n"})
-		polledPointers, pollErr := pollOpenAIImageConversation(ctx, client, headers, conversationID)
+		polledPointers, pollErr := pollOpenAIImageConversation(ctx, client, headers, conversationID, resolveOpenAIImagePollTimeout(s.cfg))
 		if pollErr != nil {
 			return s.sendErrorAndEnd(c, fmt.Sprintf("Poll failed: %s", pollErr.Error()))
 		}

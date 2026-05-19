@@ -109,6 +109,32 @@ func TestLoadAntigravityModelCapacitySwitchLimitFromEnv(t *testing.T) {
 	}
 }
 
+func TestLoadDefaultOpenAIImageTimeouts(t *testing.T) {
+	resetViperWithJWTSecret(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	require.Equal(t, DefaultGatewayOpenAIImagePollTimeoutSeconds, cfg.Gateway.OpenAIImagePollTimeoutSeconds)
+	require.Equal(t, DefaultGatewayOpenAIImageLifecycleTimeoutSeconds, cfg.Gateway.OpenAIImageLifecycleTimeoutSeconds)
+}
+
+func TestLoadOpenAIImageTimeoutsFromEnv(t *testing.T) {
+	resetViperWithJWTSecret(t)
+	t.Setenv("GATEWAY_OPENAI_IMAGE_POLL_TIMEOUT_SECONDS", "210")
+	t.Setenv("GATEWAY_OPENAI_IMAGE_LIFECYCLE_TIMEOUT_SECONDS", "270")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	require.Equal(t, 210, cfg.Gateway.OpenAIImagePollTimeoutSeconds)
+	require.Equal(t, 270, cfg.Gateway.OpenAIImageLifecycleTimeoutSeconds)
+}
+
 func TestLoadDefaultOpenAIWSConfig(t *testing.T) {
 	resetViperWithJWTSecret(t)
 
@@ -1235,6 +1261,33 @@ func TestValidateConfigErrors(t *testing.T) {
 			name:    "gateway stream data interval negative",
 			mutate:  func(c *Config) { c.Gateway.StreamDataIntervalTimeout = -1 },
 			wantErr: "gateway.stream_data_interval_timeout must be non-negative",
+		},
+		{
+			name:    "gateway openai image poll timeout positive",
+			mutate:  func(c *Config) { c.Gateway.OpenAIImagePollTimeoutSeconds = 0 },
+			wantErr: "gateway.openai_image_poll_timeout_seconds must be positive",
+		},
+		{
+			name:    "gateway openai image poll timeout max",
+			mutate:  func(c *Config) { c.Gateway.OpenAIImagePollTimeoutSeconds = 601 },
+			wantErr: "gateway.openai_image_poll_timeout_seconds must be <= 600",
+		},
+		{
+			name:    "gateway openai image lifecycle timeout positive",
+			mutate:  func(c *Config) { c.Gateway.OpenAIImageLifecycleTimeoutSeconds = 0 },
+			wantErr: "gateway.openai_image_lifecycle_timeout_seconds must be positive",
+		},
+		{
+			name:    "gateway openai image lifecycle timeout max",
+			mutate:  func(c *Config) { c.Gateway.OpenAIImageLifecycleTimeoutSeconds = 901 },
+			wantErr: "gateway.openai_image_lifecycle_timeout_seconds must be <= 900",
+		},
+		{
+			name: "gateway openai image lifecycle timeout covers poll and downloads",
+			mutate: func(c *Config) {
+				c.Gateway.OpenAIImageLifecycleTimeoutSeconds = c.Gateway.OpenAIImagePollTimeoutSeconds + 29
+			},
+			wantErr: "gateway.openai_image_lifecycle_timeout_seconds must be >= gateway.openai_image_poll_timeout_seconds + 30",
 		},
 		{
 			name:    "gateway max line size",

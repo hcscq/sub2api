@@ -4,16 +4,27 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/gin-gonic/gin"
+	"github.com/imroc/req/v3"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 )
+
+type openAIImagesRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f openAIImagesRoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
 
 func TestOpenAIGatewayServiceParseOpenAIImagesRequest_JSON(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -122,6 +133,48 @@ func TestOpenAIGatewayServiceParseOpenAIImagesRequest_RejectsNonImageModel(t *te
 	parsed, err := svc.ParseOpenAIImagesRequest(c, body)
 	require.Nil(t, parsed)
 	require.ErrorContains(t, err, `images endpoint requires an image model, got "gpt-5.4"`)
+}
+
+func TestResolveOpenAIImageTimeouts(t *testing.T) {
+	require.Equal(t, 180*time.Second, resolveOpenAIImagePollTimeout(nil))
+	require.Equal(t, 240*time.Second, resolveOpenAIImageLifecycleTimeout(nil))
+
+	cfg := &config.Config{
+		Gateway: config.GatewayConfig{
+			OpenAIImagePollTimeoutSeconds:      210,
+			OpenAIImageLifecycleTimeoutSeconds: 270,
+		},
+	}
+
+	require.Equal(t, 210*time.Second, resolveOpenAIImagePollTimeout(cfg))
+	require.Equal(t, 270*time.Second, resolveOpenAIImageLifecycleTimeout(cfg))
+}
+
+func TestPollOpenAIImageConversation_ReturnsSyntheticTimeout(t *testing.T) {
+	calls := 0
+	client := req.C()
+	client.GetClient().Transport = openAIImagesRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls++
+		require.Equal(t, "chatgpt.com", r.URL.Host)
+		require.Equal(t, "/backend-api/conversation/conv-timeout", r.URL.Path)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"mapping":{}}`)),
+			Request:    r,
+		}, nil
+	})
+
+	pointers, err := pollOpenAIImageConversation(context.Background(), client, http.Header{}, "conv-timeout", 5*time.Millisecond)
+	require.Nil(t, pointers)
+	require.Error(t, err)
+
+	var statusErr *openAIImageStatusError
+	require.ErrorAs(t, err, &statusErr)
+	require.Equal(t, http.StatusRequestTimeout, statusErr.StatusCode)
+	require.Contains(t, statusErr.Message, "openai image generation timed out")
+	require.GreaterOrEqual(t, calls, 1)
 }
 
 func TestRewriteOpenAIImagesModel_StripsUnsupportedResponseFormat(t *testing.T) {
