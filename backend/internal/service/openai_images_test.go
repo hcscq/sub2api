@@ -212,6 +212,98 @@ func TestCollectOpenAIImagePointers_RecognizesDirectAssets(t *testing.T) {
 	require.True(t, sawPointer)
 }
 
+func TestExtractOpenAIImageConversationState_UsesOnlyImageGenToolOutput(t *testing.T) {
+	state := extractOpenAIImageConversationState([]byte(`{
+		"async_status": 4,
+		"mapping": {
+			"user_msg": {
+				"message": {
+					"author": {"role": "user"},
+					"status": "finished_successfully",
+					"content": {
+						"content_type": "multimodal_text",
+						"parts": [
+							{"asset_pointer": "sediment://input_image", "content_type": "image_asset_pointer"},
+							"replace text"
+						]
+					},
+					"metadata": {}
+				}
+			},
+			"tool_msg": {
+				"message": {
+					"author": {"role": "tool"},
+					"status": "finished_successfully",
+					"create_time": 1770000000,
+					"content": {
+						"content_type": "multimodal_text",
+						"parts": [
+							{"asset_pointer": "sediment://output_image", "content_type": "image_asset_pointer"}
+						]
+					},
+					"metadata": {
+						"async_task_type": "image_gen",
+						"async_task_id": "imagegen_success",
+						"image_gen_title": "updated image"
+					}
+				}
+			}
+		}
+	}`))
+
+	require.Equal(t, "4", state.AsyncStatus)
+	require.Equal(t, 1, state.ImageGenMessages)
+	require.False(t, state.HasImageGenError())
+	require.Len(t, state.OutputPointerInfo, 1)
+	require.Equal(t, "sediment://output_image", state.OutputPointerInfo[0].Pointer)
+	require.Equal(t, "updated image", state.OutputPointerInfo[0].Prompt)
+}
+
+func TestExtractOpenAIImageConversationState_DetectsImageGenErrorAndIgnoresInputAsset(t *testing.T) {
+	state := extractOpenAIImageConversationState([]byte(`{
+		"async_status": "4",
+		"mapping": {
+			"user_msg": {
+				"message": {
+					"author": {"role": "user"},
+					"status": "finished_successfully",
+					"content": {
+						"content_type": "multimodal_text",
+						"parts": [
+							{"asset_pointer": "sediment://input_image", "content_type": "image_asset_pointer"},
+							"edit this image"
+						]
+					},
+					"metadata": {}
+				}
+			},
+			"error_msg": {
+				"message": {
+					"author": {"role": "assistant"},
+					"status": "finished_successfully",
+					"create_time": 1770000010,
+					"content": {
+						"content_type": "text",
+						"parts": ["生成的图片可能违反了防护限制，请修改提示语。"]
+					},
+					"metadata": {
+						"async_task_type": "image_gen",
+						"async_task_id": "imagegen_failed",
+						"is_error": true
+					}
+				}
+			}
+		}
+	}`))
+
+	require.Equal(t, "4", state.AsyncStatus)
+	require.Equal(t, 1, state.ImageGenMessages)
+	require.True(t, state.HasImageGenError())
+	require.Equal(t, "imagegen_failed", state.ErrorTaskID)
+	require.Contains(t, state.ErrorReason, "防护限制")
+	require.Empty(t, state.OutputPointerInfo)
+}
+
 func TestResolveOpenAIImageBytes_PrefersInlineBase64(t *testing.T) {
 	data, err := resolveOpenAIImageBytes(context.Background(), nil, nil, "", openAIImagePointerInfo{
 		B64JSON: "data:image/png;base64,QUJD",

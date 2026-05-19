@@ -1373,6 +1373,18 @@ type openAIImageToolMessage struct {
 	PointerInfos []openAIImagePointerInfo
 }
 
+type openAIImageConversationState struct {
+	AsyncStatus       string
+	ImageGenMessages  int
+	OutputPointerInfo []openAIImagePointerInfo
+	ErrorTaskID       string
+	ErrorReason       string
+}
+
+func (s openAIImageConversationState) HasImageGenError() bool {
+	return strings.TrimSpace(s.ErrorReason) != "" || strings.TrimSpace(s.ErrorTaskID) != ""
+}
+
 func readOpenAIImageConversationStream(resp *req.Response, startTime time.Time) (string, []openAIImagePointerInfo, OpenAIUsage, *int, error) {
 	if resp == nil || resp.Body == nil {
 		return "", nil, OpenAIUsage{}, nil, fmt.Errorf("empty conversation response")
@@ -1649,6 +1661,90 @@ func extractOpenAIImageToolMessages(mapping map[string]any) []openAIImageToolMes
 	return out
 }
 
+func extractOpenAIImageConversationState(body []byte) openAIImageConversationState {
+	if len(body) == 0 {
+		return openAIImageConversationState{}
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		return openAIImageConversationState{}
+	}
+	state := openAIImageConversationState{
+		AsyncStatus: openAIJSONScalarString(decoded["async_status"]),
+	}
+	mapping, _ := decoded["mapping"].(map[string]any)
+	if len(mapping) == 0 {
+		return state
+	}
+
+	toolMessages := extractOpenAIImageToolMessages(mapping)
+	for _, msg := range toolMessages {
+		state.OutputPointerInfo = mergeOpenAIImagePointerInfos(state.OutputPointerInfo, msg.PointerInfos)
+	}
+
+	var latestErrorAt float64
+	for _, raw := range mapping {
+		node, _ := raw.(map[string]any)
+		if node == nil {
+			continue
+		}
+		message, _ := node["message"].(map[string]any)
+		if message == nil {
+			continue
+		}
+		metadata, _ := message["metadata"].(map[string]any)
+		if metadata == nil {
+			continue
+		}
+		if asyncTaskType, _ := metadata["async_task_type"].(string); asyncTaskType != "image_gen" {
+			continue
+		}
+		state.ImageGenMessages++
+		if isError, _ := metadata["is_error"].(bool); !isError {
+			continue
+		}
+		createTime, _ := message["create_time"].(float64)
+		if state.ErrorReason != "" && createTime < latestErrorAt {
+			continue
+		}
+		state.ErrorTaskID, _ = metadata["async_task_id"].(string)
+		state.ErrorReason = extractOpenAIImageMessageText(message)
+		latestErrorAt = createTime
+	}
+	return state
+}
+
+func openAIJSONScalarString(value any) string {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case float64:
+		if v == float64(int64(v)) {
+			return strconv.FormatInt(int64(v), 10)
+		}
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case bool:
+		return strconv.FormatBool(v)
+	default:
+		return ""
+	}
+}
+
+func extractOpenAIImageMessageText(message map[string]any) string {
+	content, _ := message["content"].(map[string]any)
+	if content == nil {
+		return ""
+	}
+	parts, _ := content["parts"].([]any)
+	textParts := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if text, ok := part.(string); ok && strings.TrimSpace(text) != "" {
+			textParts = append(textParts, strings.TrimSpace(text))
+		}
+	}
+	return strings.TrimSpace(strings.Join(textParts, "\n"))
+}
+
 func pollOpenAIImageConversation(ctx context.Context, client *req.Client, headers http.Header, conversationID string) ([]openAIImagePointerInfo, error) {
 	conversationID = strings.TrimSpace(conversationID)
 	if conversationID == "" {
@@ -1677,24 +1773,35 @@ func pollOpenAIImageConversation(ctx context.Context, client *req.Client, header
 					lastErr = readErr
 					goto waitNextPoll
 				}
-				pointers := mergeOpenAIImagePointerInfos(nil, collectOpenAIImagePointers(body))
-				var decoded map[string]any
-				if err := json.Unmarshal(body, &decoded); err == nil {
-					if mapping, _ := decoded["mapping"].(map[string]any); len(mapping) > 0 {
-						toolMessages := extractOpenAIImageToolMessages(mapping)
-						if len(toolMessages) > 0 && firstToolAt.IsZero() {
-							firstToolAt = time.Now()
-						}
-						for _, msg := range toolMessages {
-							pointers = mergeOpenAIImagePointerInfos(pointers, msg.PointerInfos)
-						}
-					}
+				state := extractOpenAIImageConversationState(body)
+				pointers := mergeOpenAIImagePointerInfos(nil, state.OutputPointerInfo)
+				if len(pointers) > 0 && firstToolAt.IsZero() {
+					firstToolAt = time.Now()
 				}
 				if hasOpenAIFileServicePointerInfos(pointers) {
 					return preferOpenAIFileServicePointerInfos(pointers), nil
 				}
 				if len(pointers) > 0 && !firstToolAt.IsZero() && time.Since(firstToolAt) >= previewWait {
 					return pointers, nil
+				}
+				if len(pointers) == 0 && state.HasImageGenError() {
+					reason := strings.TrimSpace(state.ErrorReason)
+					if reason == "" {
+						reason = "image generation failed"
+					}
+					logger.LegacyPrintf(
+						"service.openai_gateway",
+						"[OpenAI] Image conversation task failed conversation_id=%s async_status=%s async_task_id=%s reason=%s",
+						conversationID,
+						state.AsyncStatus,
+						state.ErrorTaskID,
+						truncateString(reason, 240),
+					)
+					return nil, newOpenAIImageSyntheticStatusError(
+						http.StatusBadRequest,
+						"openai image generation failed: "+reason,
+						fmt.Sprintf("https://chatgpt.com/backend-api/conversation/%s", conversationID),
+					)
 				}
 			} else {
 				statusErr := newOpenAIImageStatusError(resp, "conversation poll failed")
@@ -2165,6 +2272,22 @@ func (s *OpenAIGatewayService) wrapOpenAIImageBackendError(
 			ResponseBody:           statusErr.ResponseBody,
 			RetryableOnSameAccount: retryableOnSameAccount,
 		}
+	}
+
+	if statusErr.StatusCode >= 400 && statusErr.StatusCode < 500 && c != nil && c.Writer != nil && !c.Writer.Written() {
+		errType := "invalid_request_error"
+		if statusErr.StatusCode == http.StatusTooManyRequests {
+			errType = "rate_limit_error"
+		}
+		if upstreamMsg == "" {
+			upstreamMsg = "OpenAI image request failed"
+		}
+		c.JSON(statusErr.StatusCode, gin.H{
+			"error": gin.H{
+				"type":    errType,
+				"message": upstreamMsg,
+			},
+		})
 	}
 
 	return statusErr
