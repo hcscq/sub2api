@@ -121,6 +121,17 @@ func TestLoadDefaultOpenAIImageTimeouts(t *testing.T) {
 	require.Equal(t, DefaultGatewayOpenAIImageLifecycleTimeoutSeconds, cfg.Gateway.OpenAIImageLifecycleTimeoutSeconds)
 }
 
+func TestLoadDefaultGatewayMemoryGuardrails(t *testing.T) {
+	resetViperWithJWTSecret(t)
+
+	cfg, err := Load()
+	require.NoError(t, err)
+
+	require.Equal(t, int64(64*1024*1024), cfg.Server.MaxRequestBodySize)
+	require.Equal(t, int64(64*1024*1024), cfg.Gateway.MaxBodySize)
+	require.Equal(t, 16*1024*1024, cfg.Gateway.MaxLineSize)
+}
+
 func TestLoadOpenAIImageTimeoutsFromEnv(t *testing.T) {
 	resetViperWithJWTSecret(t)
 	t.Setenv("GATEWAY_OPENAI_IMAGE_POLL_TIMEOUT_SECONDS", "210")

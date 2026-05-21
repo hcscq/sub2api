@@ -27,11 +27,11 @@ server:
   # Trusted proxies for X-Forwarded-For parsing (CIDR/IP). Empty disables trusted proxies.
   # 信任的代理地址（CIDR/IP 格式），用于解析 X-Forwarded-For 头。留空则禁用代理信任。
   trusted_proxies: []
-  # Global max request body size in bytes (default: 256MB)
-  # 全局最大请求体大小（字节，默认 256MB）
+  # Global max request body size in bytes (default: 64MB)
+  # 全局最大请求体大小（字节，默认 64MB）
   # Applies to all requests, especially important for h2c first request memory protection
   # 适用于所有请求，对 h2c 第一请求的内存保护尤为重要
-  max_request_body_size: 268435456
+  max_request_body_size: 67108864
   # HTTP/2 Cleartext (h2c) configuration
   # HTTP/2 Cleartext (h2c) 配置
   h2c:
@@ -149,9 +149,9 @@ gateway:
   # Timeout for waiting upstream response headers (seconds)
   # 等待上游响应头超时时间（秒）
   response_header_timeout: 600
-  # Max request body size in bytes (default: 256MB)
-  # 请求体最大字节数（默认 256MB）
-  max_body_size: 268435456
+  # Max request body size in bytes (default: 64MB)
+  # 请求体最大字节数（默认 64MB）
+  max_body_size: 67108864
   # Max bytes to read for non-stream upstream responses (default: 8MB)
   # 非流式上游响应体读取上限（默认 8MB）
   upstream_response_read_max_bytes: 8388608
@@ -163,7 +163,7 @@ gateway:
   gemini_debug_response_headers: false
   # Sora max request body size in bytes (0=use max_body_size)
   # Sora 请求体最大字节数（0=使用 max_body_size）
-  sora_max_body_size: 268435456
+  sora_max_body_size: 67108864
   # Sora stream timeout (seconds, 0=disable)
   # Sora 流式请求总超时（秒，0=禁用）
   sora_stream_timeout_seconds: 900
@@ -349,9 +349,9 @@ gateway:
   # Stream keepalive interval (seconds), 0=disable
   # 流式 keepalive 间隔（秒），0=禁用
   stream_keepalive_interval: 10
-  # SSE max line size in bytes (default: 40MB)
-  # SSE 单行最大字节数（默认 40MB）
-  max_line_size: 41943040
+  # SSE max line size in bytes (default: 16MB)
+  # SSE 单行最大字节数（默认 16MB）
+  max_line_size: 16777216
   # Log upstream error response body summary (safe/truncated; does not log request content)
   # 记录上游错误响应体摘要（安全/截断；不记录请求内容）
   log_upstream_error_body: true

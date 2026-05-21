@@ -66,6 +66,54 @@ func TestAttachOpsRequestBodyToEntry_SanitizeAndTrim(t *testing.T) {
 	require.Equal(t, int64(1), OpsErrorLogSanitizedTotal())
 }
 
+func TestSetOpsRequestContext_StoresBoundedRawSnapshot(t *testing.T) {
+	resetOpsErrorLoggerStateForTest(t)
+	gin.SetMode(gin.TestMode)
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	raw := []byte(`{"access_token":"secret-token","messages":[{"role":"user","content":"hello"}]}`)
+	setOpsRequestContext(c, "claude-3", false, raw)
+
+	stored, ok := c.Get(opsRequestBodyKey)
+	require.True(t, ok)
+	snapshot, ok := stored.(opsRequestBodySnapshot)
+	require.True(t, ok)
+	require.Equal(t, len(raw), snapshot.OriginalBytes)
+	require.False(t, snapshot.Truncated)
+	require.Equal(t, raw, snapshot.Raw)
+}
+
+func TestSetOpsRequestContext_LargeBodyStoresOnlyTruncatedMarker(t *testing.T) {
+	resetOpsErrorLoggerStateForTest(t)
+	gin.SetMode(gin.TestMode)
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	raw := make([]byte, opsRequestBodyContextMaxBytes+1)
+	setOpsRequestContext(c, "claude-3", false, raw)
+
+	stored, ok := c.Get(opsRequestBodyKey)
+	require.True(t, ok)
+	snapshot, ok := stored.(opsRequestBodySnapshot)
+	require.True(t, ok)
+	require.Equal(t, len(raw), snapshot.OriginalBytes)
+	require.True(t, snapshot.Truncated)
+	require.Empty(t, snapshot.Raw)
+
+	entry := &service.OpsInsertErrorLogInput{}
+	attachOpsRequestBodyToEntry(c, entry)
+	require.NotNil(t, entry.RequestBodyBytes)
+	require.Equal(t, len(raw), *entry.RequestBodyBytes)
+	require.NotNil(t, entry.RequestBodyJSON)
+	require.JSONEq(t, `{"request_body_truncated":true}`, *entry.RequestBodyJSON)
+	require.True(t, entry.RequestBodyTruncated)
+}
+
 func TestAttachOpsRequestBodyToEntry_InvalidJSONKeepsSize(t *testing.T) {
 	resetOpsErrorLoggerStateForTest(t)
 	gin.SetMode(gin.TestMode)

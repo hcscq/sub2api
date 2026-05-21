@@ -19,6 +19,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/handler"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/memlimit"
 	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/setup"
 	"github.com/Wei-Shaw/sub2api/internal/web"
@@ -57,6 +58,9 @@ func init() {
 func main() {
 	logger.InitBootstrap()
 	defer logger.Sync()
+	if result := memlimit.ApplyAutoMemoryLimit(); result.Applied {
+		log.Printf("Auto GOMEMLIMIT set from cgroup: cgroup_limit=%d runtime_limit=%d", result.CgroupLimit, result.RuntimeLimit)
+	}
 
 	// Parse command line flags
 	setupMode := flag.Bool("setup", false, "Run setup wizard in CLI mode")

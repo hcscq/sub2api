@@ -47,6 +47,12 @@ const (
 	opsCodeUserInactive         = "USER_INACTIVE"
 )
 
+type opsRequestBodySnapshot struct {
+	Raw           []byte
+	OriginalBytes int
+	Truncated     bool
+}
+
 const (
 	opsErrorLogTimeout      = 5 * time.Second
 	opsErrorLogDrainTimeout = 10 * time.Second
@@ -59,6 +65,7 @@ const (
 	opsErrorLogMinQueueSize       = 256
 	opsErrorLogMaxQueueSize       = 8192
 	opsErrorLogBatchSize          = 32
+	opsRequestBodyContextMaxBytes = 256 * 1024
 )
 
 type opsErrorLogJob struct {
@@ -340,12 +347,27 @@ func setOpsRequestContext(c *gin.Context, model string, stream bool, requestBody
 	c.Set(opsModelKey, model)
 	c.Set(opsStreamKey, stream)
 	if len(requestBody) > 0 {
-		c.Set(opsRequestBodyKey, requestBody)
+		if _, exists := c.Get(opsRequestBodyKey); !exists {
+			c.Set(opsRequestBodyKey, newOpsRequestBodySnapshot(requestBody))
+		}
 	}
 	if c.Request != nil && model != "" {
 		ctx := context.WithValue(c.Request.Context(), ctxkey.Model, model)
 		c.Request = c.Request.WithContext(ctx)
 	}
+}
+
+func newOpsRequestBodySnapshot(requestBody []byte) opsRequestBodySnapshot {
+	snapshot := opsRequestBodySnapshot{OriginalBytes: len(requestBody)}
+	if len(requestBody) == 0 {
+		return snapshot
+	}
+	if len(requestBody) > opsRequestBodyContextMaxBytes {
+		snapshot.Truncated = true
+		return snapshot
+	}
+	snapshot.Raw = append([]byte(nil), requestBody...)
+	return snapshot
 }
 
 // setOpsEndpointContext stores upstream model and request type for ops error logging.
@@ -368,11 +390,39 @@ func attachOpsRequestBodyToEntry(c *gin.Context, entry *service.OpsInsertErrorLo
 	if !ok {
 		return
 	}
-	raw, ok := v.([]byte)
-	if !ok || len(raw) == 0 {
+	switch snapshot := v.(type) {
+	case opsRequestBodySnapshot:
+		attachOpsRequestBodySnapshotToEntry(snapshot, entry)
+		return
+	case []byte:
+		if len(snapshot) == 0 {
+			return
+		}
+		entry.RequestBodyJSON, entry.RequestBodyTruncated, entry.RequestBodyBytes = service.PrepareOpsRequestBodyForQueue(snapshot)
+		opsErrorLogSanitized.Add(1)
+		return
+	default:
 		return
 	}
-	entry.RequestBodyJSON, entry.RequestBodyTruncated, entry.RequestBodyBytes = service.PrepareOpsRequestBodyForQueue(raw)
+}
+
+func attachOpsRequestBodySnapshotToEntry(snapshot opsRequestBodySnapshot, entry *service.OpsInsertErrorLogInput) {
+	if entry == nil || snapshot.OriginalBytes <= 0 {
+		return
+	}
+	bytesLen := snapshot.OriginalBytes
+	entry.RequestBodyBytes = &bytesLen
+	if snapshot.Truncated {
+		body := `{"request_body_truncated":true}`
+		entry.RequestBodyJSON = &body
+		entry.RequestBodyTruncated = true
+		opsErrorLogSanitized.Add(1)
+		return
+	}
+	if len(snapshot.Raw) == 0 {
+		return
+	}
+	entry.RequestBodyJSON, entry.RequestBodyTruncated, entry.RequestBodyBytes = service.PrepareOpsRequestBodyForQueue(snapshot.Raw)
 	opsErrorLogSanitized.Add(1)
 }
 
